@@ -382,7 +382,19 @@ async function aggregateSub(backends, fmt, search, frontHost, entryPath, env) {
   });
 }
 
-// Clash/Karing（YAML）合并：以第一个成功后端为模板，其余后端的 proxies 节点块加「名·」前缀后并入
+// 保留用户设置的节点名；只有重名时才追加后端编号，避免显示部署项目名。
+function uniqueSubscriptionName(name, backendIndex, used) {
+  let result = name;
+  let suffix = 1;
+  while (used.has(result)) {
+    result = name + "·后端" + (backendIndex + 1) + (suffix > 1 ? "-" + suffix : "");
+    suffix++;
+  }
+  used.add(result);
+  return result;
+}
+
+// Clash/Karing（YAML）合并：以第一个成功后端为模板，并入其余后端节点。
 function yamlName(value) {
   value = value.trim();
   if (value.startsWith('"')) {
@@ -411,9 +423,10 @@ function mergeClash(ok) {
     firstNames.push(yamlName(name));
     return _;
   });
+  const usedNames = new Set(firstNames);
   for (let i = 1; i < ok.length; i++) {
     const block = nodeSection(ok[i].text).replace(/^(  - name:\s*)(.+)$/gm, (_, prefix, name) => {
-      const renamed = ok[i].name + "·" + yamlName(name);
+      const renamed = uniqueSubscriptionName(yamlName(name), i, usedNames);
       extraNames.push(renamed);
       return prefix + JSON.stringify(renamed);
     });
@@ -462,6 +475,7 @@ function mergeSingbox(ok) {
   const isNode = (o) => o && !["selector", "urltest", "direct", "block", "dns"].includes(o.type);
   const firstNames = new Set(base.outbounds.filter(isNode).map((o) => o.tag));
   const existing = new Set(base.outbounds.map((o) => o.tag));
+  const usedNames = new Set(existing);
   const additions = [];
   for (let i = 1; i < ok.length; i++) {
     let other;
@@ -471,7 +485,7 @@ function mergeSingbox(ok) {
       continue;
     }
     const names = new Map(
-      (other.outbounds || []).filter(isNode).map((o) => [o.tag, ok[i].name + "·" + o.tag]),
+      (other.outbounds || []).filter(isNode).map((o) => [o.tag, uniqueSubscriptionName(o.tag, i, usedNames)]),
     );
     for (const outbound of other.outbounds || []) {
       if (!isNode(outbound)) continue;
