@@ -8,5 +8,5 @@
 ⭐ 后端 Pages 对接示例：后端1:backend-example.pages.dev,API通讯密钥
 ⭐ 配置绑定和环境变量后重新部署；Pages 不自动触发 Worker Cron 定时任务。
 
-⭐ 本版前后端源码分别为 CFNext-前端Pages版.js / CFNext-后端Pages版.js，ZIP 内为同一源码。
+⭐ 本版前后端源码分别为 CFNext-前端Pages版.js / CFNext-后端Pages版.js，ZIP 内为对应源码的混淆构建，外部 JS 保持明文。
 ⭐ 多后端分流需要前后端同时更新；多账号配额在面板“配额安全”中分别配置，前端账号也应单独监控。

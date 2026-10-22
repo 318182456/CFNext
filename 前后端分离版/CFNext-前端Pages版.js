@@ -28,7 +28,7 @@
  *      面板里的「管理密码」改为修改前端登录密码，与后端无关。
  *   3) 面板所有 /<entry>/api/* 与 /<entry>/sub/* 转发到后端（注入 X-CF-Api）；
  *   4) 多后端管理（面板「多后端管理」模块）：后端列表存 K.backends，对接设置存 K.becfg；
- *      multi 开时订阅路径自动聚合全部后端节点；关时用当前后端，不可达自动顺延。
+ *      multi 开时订阅聚合全部后端；balance 显式为 true 才轮换新连接，默认按节点 UUID 固定后端并保留故障切换。
  */
 
 // ===== 登录页 / 首次设置页 =====
@@ -217,11 +217,12 @@ async function parseBackends(env) {
   return [];
 }
 
-// 读取对接设置：K.becfg = {sel, multi}；越界/非法一律收敛到默认 {0,false}
+// 读取对接设置：K.becfg = {sel, multi, balance}；默认关闭聚合与轮询，稳定模式按节点 UUID 固定后端。
 async function parseBecfg(env, len) {
   let cfg = {
     sel: 0,
     multi: false,
+    balance: false,
   };
   try {
     if (env.K && typeof env.K.get === "function") {
@@ -231,6 +232,7 @@ async function parseBecfg(env, len) {
         if (o && typeof o === "object") {
           if (Number.isInteger(o.sel)) cfg.sel = o.sel;
           if (typeof o.multi === "boolean") cfg.multi = o.multi;
+          if (typeof o.balance === "boolean") cfg.balance = o.balance;
         }
       }
     }
@@ -273,6 +275,32 @@ function buildHeaders(request, api) {
 const FALLBACK_SEG = "cf";
 function mappingSeg(b) {
   return b.uuid || b.envUuid || FALLBACK_SEG;
+}
+// Resolve the formats supported by aggregation without changing other client formats.
+function aggregateFormat(value, userAgent) {
+  const format = String(value || "").toLowerCase();
+  if (["clash", "stash", "mihomo"].includes(format)) return "clash";
+  if (["singbox", "sing-box", "hiddify"].includes(format)) return "singbox";
+  if (format && format !== "auto") return null;
+  const ua = String(userAgent || "").toLowerCase();
+  if (/sing-?box|hiddify/.test(ua)) return "singbox";
+  if (/clash|mihomo|stash|mozilla|applewebkit/.test(ua)) return "clash";
+  return null;
+}
+function subscriptionNodeCount(body, format) {
+  if (format === "singbox") {
+    try {
+      return (JSON.parse(body).outbounds || []).filter(
+        (node) => node.type && !["selector", "urltest", "url-test", "direct", "block", "dns"].includes(node.type),
+      ).length;
+    } catch (_) { return 0; }
+  }
+  const start = body.startsWith("proxies:") ? 0 : body.indexOf("\nproxies:") + 1;
+  if (start < 0 || !body.slice(start).startsWith("proxies:")) return 0;
+  const tail = body.slice(start + "proxies:".length);
+  const next = tail.search(/\n[A-Za-z][\w-]*:/);
+  const nodes = next < 0 ? tail : tail.slice(0, next);
+  return (nodes.match(/^  - (?:name\s*:|\{)/gm) || []).length;
 }
 // 聚合订阅：并行拉所有后端 /<uuid>/sub/<fmt>，合并节点（非首个后端加名称前缀），规则/组用第一个成功后端
 async function aggregateSub(backends, fmt, search, frontHost, entryPath, env) {
@@ -347,6 +375,8 @@ async function aggregateSub(backends, fmt, search, frontHost, entryPath, env) {
     headers: {
       "content-type": fmt === "singbox" ? "application/json; charset=utf-8" : "text/yaml; charset=utf-8",
       "cache-control": "no-store",
+      "X-CFNext-Backend-Count": String(ok.length),
+      "X-CFNext-Backend-Total": String(backends.length),
       "content-disposition": `attachment; filename="CFNext-aggregate.${fmt === "singbox" ? "json" : "yaml"}"`,
     },
   });
@@ -559,7 +589,7 @@ async function saveBackends(request, env) {
   }
 }
 
-// 「保存对接设置」写接口：body 为 { sel, multi }，写入 K.becfg
+// 「保存对接设置」写接口：body 为 { sel, multi, balance }，写入 K.becfg
 async function saveBecfg(request, env, len) {
   if (!env.K || typeof env.K.put !== "function") {
     return new Response(
@@ -600,12 +630,15 @@ async function saveBecfg(request, env, len) {
   let sel = Number.isInteger(body.sel) ? body.sel : 0;
   if (sel < 0 || sel >= len) sel = 0;
   const multi = !!body.multi;
+  const previous = await parseBecfg(env, len);
+  const balance = typeof body.balance === "boolean" ? body.balance : previous.balance;
   try {
     await env.K.put(
       "becfg",
       JSON.stringify({
         sel,
         multi,
+        balance,
       }),
     );
     return new Response(
@@ -2586,37 +2619,14 @@ function qrPayloadOf(fmt, url){
 function downloadSub(){
   var fmt = $('subFmt').value;
   var url = subUrlOf(fmt === 'auto' ? '' : fmt);
-  // 保存名按所选格式给出（内容随管理接口返回，不再依赖响应头里的文件名）
-  var names = { clash:__B+'.yaml', stash:__B+'.yaml', singbox:__B+'.json', surge:__B+'.conf', surfboard:__B+'.conf', loon:__B+'.conf', quanx:__B+'.conf' };
-  var name = names[fmt] || __B + '.txt';
-  var w = $('qrWrap');
-  // 兜底出口：脚本触发的保存若被浏览器或内置 WebView 拦下，就给出一个真实链接
-  // （用户手势点它一定会走浏览器原生下载，不经过脚本）
-  function alt(msg){
-    toast(msg, 'err');
-    if (!w) return;
-    w.style.display = 'block';
-    w.innerHTML = '<div class="hint" style="margin-top:0">' + msg + ' 可<a href="' + url + '" download="' + name + '" style="text-decoration:underline">点此直接下载</a>，也可复制订阅链接导入客户端。</div>';
-  }
-  toast('正在生成 ' + name + ' …', '');
-  // 与「预览」共用管理通道：订阅正文随 JSON 一并返回，
-  // 不再依赖 /sub 的 Content-Disposition —— 那条响应头在部分托管环境会被改写
-  api('sub?fmt=' + encodeURIComponent(fmt === 'auto' ? '' : fmt))
-    .then(function(r){
-      if (!r || !r.ok) throw new Error((r && r.msg) || '服务端未返回内容');
-      var body = r.body || '';
-      if (!body) throw new Error('订阅内容为空');
-      var bu = URL.createObjectURL(new Blob([body], { type: 'application/octet-stream' }));
-      var a = document.createElement('a');
-      a.href = bu;
-      a.download = name;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(function(){ URL.revokeObjectURL(bu); }, 6e4);
-      toast('已保存 ' + name + '（' + Math.max(1, Math.round(body.length / 1024)) + ' KB）', 'ok');
-    })
-    .catch(function(e){ alt('下载失败：' + ((e && e.message) || e)); });
+  var names = { auto:__B+'.yaml', clash:__B+'.yaml', stash:__B+'.yaml', singbox:__B+'.json', surge:__B+'.conf', surfboard:__B+'.conf', loon:__B+'.conf', quanx:__B+'.conf' };
+  var link = document.createElement('a');
+  link.href = url;
+  link.download = names[fmt] || __B+'.txt';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  toast('已请求下载；若未开始，可复制订阅链接在浏览器打开。', '');
 }
 function previewSub(){
   var fmt = $('subFmt').value;
@@ -2632,8 +2642,15 @@ function previewSub(){
       var type = r.type || '';
       $('prevType').textContent = type || '—';
       var n = 0;
-      if (/clash|yaml/i.test(type)) n = (body.match(/- name:/g) || []).length;
-      else if (/json/i.test(type)) n = (body.match(/"tag"/g) || []).length;
+      if (typeof r.nodeCount === 'number') n = r.nodeCount;
+      else if (/clash|yaml/i.test(type)) {
+        var section = body.split(/(?:^|\\n)proxies:\\s*\\n/)[1] || '';
+        section = section.split(/\\n[A-Za-z][\\w-]*:/)[0];
+        n = (section.match(/^  - (?:name\\s*:|\\{)/gm) || []).length;
+      }
+      else if (/json/i.test(type)) {
+        try { n = (JSON.parse(body).outbounds || []).filter(function(node){return node.type && ['selector','urltest','url-test','direct','block','dns'].indexOf(node.type)<0;}).length; } catch(e) { n=0; }
+      }
       else {
         var t = body;
         if (!/^(vless|trojan|ss|xhttp):\\/\\//m.test(t)) {
@@ -2641,7 +2658,7 @@ function previewSub(){
         }
         n = t.split('\\n').filter(function(l){ return /^(vless|trojan|ss|xhttp):\\/\\//.test(l.trim()); }).length;
       }
-      $('prevCount').textContent = n + ' 个节点';
+      $('prevCount').textContent = n + ' 个节点' + (typeof r.backendCount === 'number' ? '（聚合 ' + r.backendCount + '/' + r.backendTotal + ' 个后端）' : '');
       $('prevBody').textContent = body.length > 2600 ? body.slice(0, 2600) + '\\n…（已截断，完整内容请下载）' : body;
     })
     .catch(function(){ $('prevType').textContent = '预览失败：无法连接服务器'; $('prevBody').textContent = ''; });
@@ -2897,7 +2914,7 @@ function clearAuthCookie(headers) {
 }
 
 // 面板 HTML 注入：①「管理密码」字段改为修改前端登录密码 ②注入「多后端管理」模块
-function buildPanelHtml({ backends, sel, multi, origin, adminFromEnv, sharedApi }) {
+function buildPanelHtml({ backends, sel, multi, balance, origin, adminFromEnv, sharedApi }) {
   let html = PANEL_HTML;
 
   // ① a-admin 字段改写：提示改为「前端登录密码」，值不再进后端 config（collectForm 里 admin 字段被禁写）
@@ -2930,6 +2947,7 @@ function buildPanelHtml({ backends, sel, multi, origin, adminFromEnv, sharedApi 
       backends,
       sel,
       multi,
+      balance,
       origin,
       adminFromEnv,
       sharedApi,
@@ -2940,7 +2958,7 @@ function buildPanelHtml({ backends, sel, multi, origin, adminFromEnv, sharedApi 
 }
 
 // 面板设置页「多后端管理」卡片
-function injectBeModule({ backends, sel, multi, origin, adminFromEnv, sharedApi }) {
+function injectBeModule({ backends, sel, multi, balance, origin, adminFromEnv, sharedApi }) {
   // 只回填「显式填写」的 api；环境变量里的共享密钥不写进输入框（否则一回保存就被固化进 KV，改了 env 也不生效）
   const data = JSON.stringify({
     list: backends.map((b) => ({
@@ -2951,6 +2969,7 @@ function injectBeModule({ backends, sel, multi, origin, adminFromEnv, sharedApi 
     })),
     sel: sel || 0,
     multi: !!multi,
+    balance: !!balance,
     origin,
     shared: !!sharedApi,
   });
@@ -2975,18 +2994,24 @@ function injectBeModule({ backends, sel, multi, origin, adminFromEnv, sharedApi 
         </div>
         <div style="display:flex;align-items:center;gap:12px;margin:16px 0 10px;flex-wrap:wrap">
           <label class="switch"><input type="checkbox" id="be-multi"><span class="sl"></span></label>
-          <span style="font-size:13px">多后端聚合与均衡</span>
+          <span style="font-size:13px">多后端订阅聚合</span>
           <span style="flex:1"></span>
           <select id="be-sel" style="min-width:360px;flex:1;max-width:none"></select>
         </div>
-        <p class="hint" style="margin-top:0">开启后合并各后端订阅，并在可用后端之间轮流分配新连接；节点 UUID 用于保留原身份校验。关闭后按节点 UUID 定位后端。后端不可达、请求限流或达到账号配额阈值时，新连接切换到可用后端；已建立的连接需客户端重连。配置读写只作用于选中的后端。</p>
+        <div class="field"><label>代理连接方式</label>
+          <select id="be-balance">
+            <option value="stable">优先稳定：同一节点固定后端，故障时切换</option>
+            <option value="round-robin">轮询均衡：每个新连接轮换后端</option>
+          </select>
+        </div>
+        <p class="hint" style="margin-top:0">聚合订阅会保留全部后端的节点。默认优先稳定，每个节点使用其对应后端；轮询均衡会分摊新连接，但延迟和出口可能变化。后端握手失败、请求限流或达到账号配额阈值时，新连接切换到可用后端。已建立的连接固定使用原后端，断开后需客户端重连；不同后端可能显示不同出口 IP。配置读写作用于选中的后端。</p>
         ${adminWarn}
       </div>
       <script>
       (function(){
         var D = ${data};
         function $(id){ return document.getElementById(id); }
-        var ta=$('be-urls'), sel=$('be-sel'), mul=$('be-multi'), tip=$('be-shared-tip');
+        var ta=$('be-urls'), sel=$('be-sel'), mul=$('be-multi'), routing=$('be-balance'), tip=$('be-shared-tip');
         if(tip){
           var base = D.shared
             ? '本前端已配置环境变量 <code>API</code>（共享密钥）：某行没单独写密钥的后端，都会用它去访问后端。'
@@ -3011,6 +3036,7 @@ function injectBeModule({ backends, sel, multi, origin, adminFromEnv, sharedApi 
         function applyMulti(){
           sel.disabled = mul.checked;
           sel.style.opacity = mul.checked ? '.5' : '1';
+          routing.disabled = !mul.checked;
         }
         function rowText(b){
           var s=b.name+':'+b.url;
@@ -3021,6 +3047,7 @@ function injectBeModule({ backends, sel, multi, origin, adminFromEnv, sharedApi 
         fillSel(D.list, D.sel);
         ta.value=D.list.map(rowText).join('\\n');
         mul.checked=D.multi;
+        routing.value=D.balance?'round-robin':'stable';
         applyMulti();
         mul.onchange=applyMulti;
         // 解析一行：名称:地址,API,UUID（API / UUID 可省略；逗号分段不干扰地址里的 :// 与端口）
@@ -3068,7 +3095,7 @@ function injectBeModule({ backends, sel, multi, origin, adminFromEnv, sharedApi 
               .then(function(r){return r.json();})
               .then(function(r){
                 if(!(r&&r.ok)){ toast((r&&r.msg)||'后端列表保存失败','err'); throw new Error('be'); }
-                return fetch('/becfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sel:mul.checked?0:(parseInt(sel.value,10)||0),multi:mul.checked})})
+                return fetch('/becfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sel:mul.checked?0:(parseInt(sel.value,10)||0),multi:mul.checked,balance:routing.value==='round-robin'})})
                   .then(function(r2){return r2.json();});
               })
               .then(function(r2){
@@ -3788,6 +3815,7 @@ export default {
           backends: bl,
           sel: bc.sel,
           multi: bc.multi,
+          balance: bc.balance,
           origin: u.origin,
           adminFromEnv: !!envAdmin,
           sharedApi: String(env.API || env.GATE || "").trim(),
@@ -3873,6 +3901,7 @@ export default {
           backends: status,
           sel: becfg.sel,
           multi: becfg.multi,
+          balance: becfg.balance,
           aggregate: u.origin + "/aggregate/sub/clash",
         }),
         {
@@ -3952,7 +3981,7 @@ export default {
       const d = gate();
       if (d) return d;
       try {
-        await proxyFailover(request, backends, becfg.sel, u.pathname, u.search, entry, env, becfg.multi);
+        await proxyFailover(request, backends, becfg.sel, u.pathname, u.search, entry, env, becfg.multi && becfg.balance);
       } catch (_) {}
       try {
         if (env.K && typeof env.K.delete === "function") await env.K.delete("admin");
@@ -3977,16 +4006,41 @@ export default {
     // 到这里还没配后端：非入口页给提示页（入口页展示面板，可在面板里添加后端）
     if (!backends.length) return P(HINT);
 
+    // Download and preview use this authenticated JSON endpoint, so aggregate
+    // its body as well as the public subscription URLs.
+    if (becfg.multi && entryPath && u.pathname === entryPath + "/api/sub") {
+      const denied = gate();
+      if (denied) return denied;
+      const format = aggregateFormat(u.searchParams.get("fmt"), request.headers.get("User-Agent"));
+      if (format && (request.method === "GET" || request.method === "HEAD")) {
+        const response = await aggregateSub(backends, format, u.search, u.hostname, entry, env);
+        const body = await response.text();
+        if (!response.ok) return J({ ok: false, msg: body }, response.status);
+        return J({
+          ok: true,
+          type: format === "singbox" ? "application/json" : "text/yaml",
+          body,
+          nodeCount: subscriptionNodeCount(body, format),
+          backendCount: Number(response.headers.get("X-CFNext-Backend-Count")),
+          backendTotal: Number(response.headers.get("X-CFNext-Backend-Total")),
+        });
+      }
+    }
+
     // ---- 聚合订阅端点 ----
     if (u.pathname.startsWith("/aggregate/sub/")) {
-      const m = u.pathname.match(/^\/aggregate\/sub\/([^/]+)$/);
-      if (m) return await aggregateSub(backends, m[1], u.search, u.hostname, entry, env);
+      const m = u.pathname.match(/^\/aggregate\/sub(?:\/([^/]+))?\/?$/);
+      if (m) {
+        const format = aggregateFormat(m[1] || u.searchParams.get("fmt"), request.headers.get("User-Agent"));
+        return await aggregateSub(backends, format || m[1] || "clash", u.search, u.hostname, entry, env);
+      }
     }
 
     // ---- 多后端聚合与均衡：订阅路径改走聚合 ----
     if (becfg.multi) {
-      const sm = u.pathname.match(/^\/[^/]+\/sub\/(clash|singbox|karing)\/?$/);
-      if (sm) return await aggregateSub(backends, sm[1], u.search, u.hostname, entry, env);
+      const sm = u.pathname.match(/^\/[^/]+\/sub(?:\/([^/]+))?\/?$/);
+      const format = sm && aggregateFormat(sm[1] || u.searchParams.get("fmt"), request.headers.get("User-Agent"));
+      if (format) return await aggregateSub(backends, format, u.search, u.hostname, entry, env);
     }
 
     // ---- 面板页（<entry>）在上面的登录闸门里已返回，这里不再重复；----
@@ -3997,7 +4051,7 @@ export default {
       if (d) return d;
     }
     try {
-      return await proxyFailover(request, backends, becfg.sel, u.pathname, u.search, entry, env, becfg.multi);
+      return await proxyFailover(request, backends, becfg.sel, u.pathname, u.search, entry, env, becfg.multi && becfg.balance);
     } catch (e) {
       return new Response("backend unreachable: " + ((e && e.message) || e), {
         status: 502,

@@ -2343,10 +2343,9 @@ async function qt(t, e, n) {
     }),
   ]);
   if ((i && (clearTimeout(i), (i = null)), c && "__GRACE__" !== c)) return ((r = c), s.then(o), r);
-  const l = await s;
-  if (l) return ((r = l), a.then(o), r);
-  const u = await a;
-  return u ? ((r = u), r) : null;
+  // Keep racing after the direct grace period. A slow fallback must not block
+  // a direct connection that has already opened. Kt closes the losing sockets.
+  return Kt([() => a, () => s]);
 }
 function te(t) {
   return !t || t.byteLength < 3 ? "unknown" : 22 === t[0] && 3 === t[1] ? "tls" : "nontls";
