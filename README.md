@@ -375,10 +375,11 @@ Proxy-HK.SenflareLink.Kdns.fr,Proxy-TW.SenflareLink.Kdns.fr,Proxy-JP.SenflareLin
 | 单文件·混淆版   | `CFNext-混淆版.js`       | Worker      | 面板 + 后端一体，terser 混淆 + ASCII 化，**日常部署推荐** |
 | 单文件·小说混淆版 | `CFNext-小说混淆版.js`     | Worker      | 面板 + 后端一体，正文嵌入语料、占比约 66%，体积最大            |
 | 单文件·Pages | `CFNext-混淆Pages版.zip` | Pages（高级模式） | 单文件混淆版打包为 `_worker.js`，走 Pages 通道        |
-| 分离版·后端    | `CFNext-后端Worker版.js` | Worker      | 纯节点 / 订阅 / `/api/*`，**无面板、无登录**          |
+| 分离版·后端（Pages） | `前后端分离版/CFNext-后端Pages版.zip` | Pages（高级模式） | 纯节点 / 订阅 / `/api/*`，**无面板、无登录** |
+| 分离版·后端（Worker） | `前后端分离版/CFNext-后端Worker版.js` | Worker | 保留 Worker 部署方式 |
 | 分离版·前端    | `CFNext-前端Pages版.zip` | Pages（高级模式） | 面板 UI + 登录 + 多后端管理 + 聚合下发                |
 
-> **前后端分离版**：前端 Pages 负责面板 / 登录 / 多后端（可跨账户），后端 Wo*rker 只存参数、生成订阅；前端把 `/<入口>/api/*`、`/<入口>/sub/*` 映射到后端并注入 API 密钥。后端不暴露任何独立入口，只能经前端访问*。  
+> **前后端分离版**：前端 Pages 负责面板 / 登录 / 多后端（可跨账户），后端 Pages / Worker 只存参数、生成订阅；前端把 `/<入口>/api/*`、`/<入口>/sub/*` 映射到后端并注入 API 密钥。后端不暴露任何独立入口，只能经前端访问。
 > **单文件版**：面板与后端一体，一次部署即用，无多后端管理模块。
 
 ## 四、部署说明
@@ -394,10 +395,35 @@ Proxy-HK.SenflareLink.Kdns.fr,Proxy-TW.SenflareLink.Kdns.fr,Proxy-JP.SenflareLin
 ### Pages 部署
 
 1. 创建 Pages 项目（高级模式 / 直接上传）。
-2. 上传 `_worker.js`（分离版前端或单文件 Pages）。
+2. 直接上传对应 ZIP（分离版前端、分离版后端或单文件 Pages）；ZIP 根目录包含 `_worker.js` 和可选的 `_routes.json`。
 3. 绑定 KV：变量名 **`K`**（生产 + 预览环境）。
 4. 设置环境变量（仅填必填项）。
 5. **注意顺序**：先建项目 → 设环境变量 → 绑定 KV → **最后部署**（绑定与环境变量只对之后新建的部署生效）。
+
+### 前后端均使用 Pages（分离版）
+
+1. 创建两个独立的 Pages 项目，分别作为前端和后端。
+2. 后端上传 `前后端分离版/CFNext-后端Pages版.zip`，绑定 KV 变量 **`K`**，设置 Secret **`API`** 为自定义通讯密钥；设置完成后重新部署，使绑定和密钥生效。
+3. 前端上传 `前后端分离版/CFNext-前端Pages版.zip`，绑定前端自己的 KV 变量 **`K`**，设置 `L`（或 `login`）为面板入口路径；设置完成后重新部署。前后端使用不同 KV 命名空间。
+4. 打开前端 `https://<前端项目>.pages.dev/<入口>`，设置管理密码，在多后端管理中按 `名称:后端域名,API通讯密钥` 添加后端，例如 `后端1:backend-example.pages.dev,你的通讯密钥`。也可填写后端绑定的自定义域名。
+5. 后端域名根路径显示伪装页属于正常行为；通过前端面板读取、保存配置及生成订阅。
+
+后端 Pages ZIP 保留现有后端逻辑，所有路径均进入 `_worker.js`，API 密钥与前端对接协议不变。Cloudflare Pages 不提供 Worker Cron Triggers，原 `scheduled` 定时任务（如 `BESTIP_AUTO` / `HOME_WAN_AUTO`）不会自动触发；需要这些定时任务时继续使用 Worker 后端。面板手动操作不受此限制。
+
+部署方式参考 [Cloudflare Pages 直接上传](https://developers.cloudflare.com/pages/get-started/direct-upload/) 与 [高级模式](https://developers.cloudflare.com/pages/functions/advanced-mode/)。
+
+### 分离版多后端分流与多账号配额
+
+- 源码为未压缩明文，中文和固定编码字符串已展开，关键后端函数已命名；其余局部变量沿用现有名称，不声称恢复了原作者未提供的变量名。
+- 源码在 `前后端分离版/CFNext-前端Pages版.js` 和 `前后端分离版/CFNext-后端Pages版.js`；对应 ZIP 内的 `_worker.js` 与这些源码一致。修改后将源码命名为 `_worker.js` 放到 ZIP 根目录，保留 `_routes.json`。
+- 前后端都需要更新为本版。开启“多后端聚合与均衡”后，新隧道连接在可用后端间轮流分配（各运行实例随机起点，避免新实例都压到第一个后端）；关闭时按节点路径 UUID 选择后端。跨后端转发由前端注入原 UUID，后端只在 API 密钥正确时接受此身份，仍校验客户端握手。当前部署的 VLESS 配置支持该分流；使用自定义 Trojan 密码时，各后端密码和协议开关需保持一致。
+- HTTP 429、500、502、503、504、Cloudflare 1027 或网络错误会触发握手前切换，并将故障后端冷却 60 秒。已建立的连接不会迁移，需要客户端重连。流式 POST 不重放已消耗的请求体，下次连接会避开冷却中的后端。配置读写固定在面板选中的后端，避免误改其它后端。
+- 聚合订阅同时把新增节点加入 Clash / sing-box 的节点选择组。更新后请在客户端刷新订阅。
+- 多账号切换阈值默认 80%。修改后可点击“保存账号设置”或底部“保存全部”；手动检查也会先保存修改，自动刷新不会覆盖未保存的输入。达到阈值按原始请求数与账号额度比较，避免显示百分比四舍五入造成提前切换。
+- “配额安全 → 多账号配额监控”支持添加、保存、删除账号、单独检查与检查全部账号。每行填写名称、32 位账户 ID、具备 Account Analytics 读取权限的 API 令牌、每日额度、切换阈值和关联后端完整域名。前端账号的关联后端留空；同账号多个后端填在同一行，以逗号分隔。
+- 令牌保存在前端 KV 或 `QUOTA_ACCOUNTS` Secret 中，接口不回传令牌；编辑时令牌留空表示保留。`QUOTA_ACCOUNTS` 可作为初始 JSON 数组，格式为 `[{"id":"账户ID","name":"账号名称","token":"令牌","limit":100000,"threshold":80,"backends":["https://后端.pages.dev"]}]`，在面板保存列表后以 KV 为准。
+- 各账号分别统计当天 Workers + Pages 请求量；查询失败单独显示错误，不当成零用量。自动检查和缓存间隔 15 分钟，429 退避 15 分钟。达到阈值的账号所关联后端会暂时退出新连接分配和订阅聚合；UTC 日期变化后旧日结果失效。统计有延迟，不能保证恰好在阈值处停止。
+- 前端仍是统一入口，前端自己的请求 / KV 额度也会消耗。多后端不会把前端账号的额度叠加，也不是按流量 GB 合并计费。
 
 ### 登录与访问
 
@@ -448,6 +474,8 @@ Proxy-HK.SenflareLink.Kdns.fr,Proxy-TW.SenflareLink.Kdns.fr,Proxy-JP.SenflareLin
 | `tgToken` / `tgChat` | Telegram 用量通知                      |
 
 ## 六、订阅模式与优选
+
+分离版 Pages 的随机模式仅生成候选地址，不代表已通过用户本地网络测速。节点数量上限只裁剪输出，不自动补足；`optimizer.fillCount=0` 时不再强制追加随机地址。大陆网络建议先用 Clash 实测，再把可用 IP 填入自定义订阅；端口可连通不代表完整代理链路可用。
 
 ### 6.1 订阅模式
 

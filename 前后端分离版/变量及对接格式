@@ -2,3 +2,11 @@
 ⭐ 前端变量名称：L/login   值：你的面板地址
 ⭐ 后端变量名称：API   值：API对接密钥
 ⭐ 前后端对接格式：名称:后端域名,API通讯密钥
+
+⭐ 前后端均可用 Pages：分别上传 CFNext-前端Pages版.zip、CFNext-后端Pages版.zip 到两个独立项目。
+⭐ 前后端各自绑定独立 KV 命名空间，变量名均为 K；后端 API 建议设置为 Secret。
+⭐ 后端 Pages 对接示例：后端1:backend-example.pages.dev,API通讯密钥
+⭐ 配置绑定和环境变量后重新部署；Pages 不自动触发 Worker Cron 定时任务。
+
+⭐ 本版前后端源码分别为 CFNext-前端Pages版.js / CFNext-后端Pages版.js，ZIP 内为同一源码。
+⭐ 多后端分流需要前后端同时更新；多账号配额在面板“配额安全”中分别配置，前端账号也应单独监控。
