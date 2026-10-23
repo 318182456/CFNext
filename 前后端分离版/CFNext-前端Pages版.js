@@ -259,7 +259,8 @@ function buildHeaders(request, api) {
       lk === "x-cf-api" ||
       lk === "x-cf-gate" ||
       lk === "x-cf-host" ||
-      lk === "x-cf-tunnel-uuid"
+      lk === "x-cf-tunnel-uuid" ||
+      lk === "x-cfnext-config-backend"
     )
       continue;
     h.set(k, v);
@@ -1110,33 +1111,10 @@ const PANEL_HTML = `
         </div>
       </div>
       <div class="card">
-        <h3><span class="tick"></span>优选节点</h3>
-        <div class="grid2">
-          <div class="field" style="margin:0"><label>订阅模式</label>
-            <select id="o-submode" onchange="onSubMode()">
-              <option value="">关闭（使用面板默认节点池）</option>
-              <option value="custom">自定义订阅（支持汇聚）</option>
-              <option value="random">随机候选模式（未测速）</option>
-            </select>
-          </div>
-          <div class="field" style="margin:0"><label>自定义模式下追加默认节点</label>
-            <select id="o-subinc">
-              <option value="0">关闭（仅自定义节点）</option>
-              <option value="1">开启（追加内置优选池与默认地区源）</option>
-            </select>
-          </div>
-        </div>
-        <div class="field" id="sm-custom" style="margin-top:14px;display:none">
-          <label>优选节点（域名 / 优选 API / IP，每行一个；IP 格式 IP:端口#名称）</label>
-          <textarea id="f-preferred" rows="6" placeholder="*.cloudflare.182682.xyz&#10;104.25.246.53:443#香港&#10;https://bestcf.pages.dev/random-region/HK/100.txt"></textarea>
-          <div class="hint">开启「自定义订阅」后生效；域名与优选 API 保存后自动解析为 IP 下发；测速「加入优选」写入此列表，保存后生效。</div>
-          <button class="btn sm" style="margin-top:8px" onclick="fetchDomains()">拉取微测网优选域名</button>
-        </div>
-        <div class="field" id="sm-random" style="margin-top:14px;display:none">
-          <label>随机优选数量（1-99）</label>
-          <input type="number" id="o-rand" min="1" max="99" value="16">
-          <div class="hint">从 Cloudflare 地址段随机生成候选地址，未经本地连通性或速度验证；大陆网络可能大量超时。建议使用本地实测可用的自定义 IP。节点上限仅限制数量，不会自动补足。</div>
-        </div>
+        <h3><span class="tick"></span>各后端优选节点</h3>
+        <p class="hint" id="preferred-summary">正在读取各后端配置…</p>
+        <p class="hint">直接修改对应后端并点击卡片内的保存按钮；各后端独立保存。</p><label for="preferred-target">测速结果加入到</label><select id="preferred-target" style="margin-bottom:14px"></select><div id="preferred-overview"></div>
+        <button class="btn sm" type="button" onclick="loadPreferredOverview()">刷新各后端列表</button>
       </div>
     </section>
 
@@ -1436,7 +1414,10 @@ var CFG = null;
 var LAST = [];
 var toastTimer = null;
 function $(id){ return document.getElementById(id); }
-function api(p, opts){
+function api(p, opts, backend){
+  opts = Object.assign({}, opts || {});
+  opts.headers = new Headers(opts.headers || {});
+  if (backend || window.CFN_CONFIG_BACKEND) opts.headers.set('X-CFNext-Config-Backend', backend || window.CFN_CONFIG_BACKEND);
   return fetch(APIPATH + '/api/' + p, opts).then(function(r){ return r.json(); });
 }
 function toast(t, ty){
@@ -2107,8 +2088,85 @@ function checkUpdate(){
 }
 
 /* ===== 配置加载与回填 ===== */
+var preferredCards = [];
+function hasPreferredDrafts(){return preferredCards.some(function(c){return c.dirty || c.saving;});}
+window.addEventListener('beforeunload',function(e){if(hasPreferredDrafts()){e.preventDefault();e.returnValue='';}});
+function preferredPayload(text){
+  var domains=[],ips=[],seen={};
+  String(text||'').split(/\\n+/).map(function(s){return s.trim();}).filter(Boolean).forEach(function(line){
+    if(line.indexOf('://')>=0){domains.push(line);return;}
+    line.split(/[;,]+/).map(function(s){return s.trim();}).filter(Boolean).forEach(function(s){
+      var list=parseIps(s);
+      if(!list.length){domains.push(s);return;}
+      var ip=list[0],key=ip.ip+':'+ip.port;
+      if(!seen[key]){seen[key]=true;ips.push(ip);}
+    });
+  });
+  return {preferredDomains:domains.join('\\n'),preferredIPs:ips};
+}
+function preferredTarget(){
+  var target=$('preferred-target');
+  return preferredCards.find(function(c){return c.backend.url===target.value;});
+}
+function loadPreferredOverview(){
+  var summary=$('preferred-summary'),wrap=$('preferred-overview'),target=$('preferred-target');
+  if(!summary || !wrap)return;
+  if(hasPreferredDrafts()&&!confirm('刷新会放弃卡片中未保存的优选配置，是否继续？'))return;
+  if(preferredCards.some(function(c){return c.saving;})){toast('请等待后端保存完成','warn');return;}
+  var previous=target.value;
+  summary.textContent='正在读取各后端配置…';
+  fetch('/preferred-backends').then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(r){
+    if(!r.ok)throw new Error(r.msg||'读取失败');
+    if(hasPreferredDrafts()){summary.textContent='刷新期间存在未保存或正在保存的修改，已保留当前卡片；保存完成后可重新刷新。';return;}
+    wrap.textContent='';wrap.className='grid2';target.textContent='';preferredCards=[];
+    var success=r.backends.filter(function(b){return !b.error;});
+    var total=success.reduce(function(n,b){return n+b.lines.length;},0);
+    summary.textContent='已读取 '+success.length+'/'+r.backends.length+' 个后端，共 '+total+' 条配置地址；'+(r.multi?'订阅聚合已开启。':'当前未开启订阅聚合。')+' 域名/API 解析、协议和配额策略可能影响实际下发数量，以订阅预览为准。';
+    r.backends.forEach(function(b){
+      var card=document.createElement('div');card.className='field';card.style.margin='0 0 16px';card.dataset.backendIndex=b.index;
+      var title=document.createElement('label');title.textContent='后端'+(b.index+1)+(b.error?' · 读取失败':' · '+b.lines.length+' 条配置地址');card.appendChild(title);
+      if(b.error){var error=document.createElement('p');error.className='hint';error.textContent=b.error;card.appendChild(error);wrap.appendChild(card);return;}
+      var option=document.createElement('option');option.value=b.url;option.textContent='后端'+(b.index+1);target.appendChild(option);
+      function select(label,entries,value){
+        var field=document.createElement('div');field.className='field';field.style.margin='8px 0';
+        var name=document.createElement('label');name.textContent=label;var input=document.createElement('select');input.setAttribute('aria-label','后端'+(b.index+1)+label);
+        entries.forEach(function(v){var o=document.createElement('option');o.value=v[0];o.textContent=v[1];input.appendChild(o);});input.value=value;field.appendChild(name);field.appendChild(input);card.appendChild(field);return input;
+      }
+      var mode=select('订阅模式',[['custom','自定义订阅（支持汇聚）'],['','默认节点池'],['random','随机候选模式（未测速）']],b.subMode);
+      var defaults=select('追加默认节点',[['0','关闭（仅自定义节点）'],['1','开启']],b.includeDefault?'1':'0');
+      var list=document.createElement('textarea');list.rows=7;list.value=b.lines.join('\\n');list.setAttribute('aria-label','后端'+(b.index+1)+'优选节点');card.appendChild(list);
+      var random=document.createElement('input');random.type='number';random.min='1';random.max='99';random.value=b.randomCount||16;random.setAttribute('aria-label','后端'+(b.index+1)+'随机候选数量');card.appendChild(random);
+      var hint=document.createElement('p');hint.className='hint';hint.textContent='每行一个：IP:端口#名称、域名或优选 API。只保存到此后端。';card.appendChild(hint);
+      var message=document.createElement('p');message.className='hint';card.appendChild(message);
+      var save=document.createElement('button');save.className='btn sm primary';save.type='button';save.textContent='保存后端'+(b.index+1);card.appendChild(save);
+      var c={backend:b,list:list,mode:mode,defaults:defaults,random:random,dirty:false,saving:false};preferredCards.push(c);
+      function visibility(){list.style.display=mode.value==='custom'?'':'none';random.style.display=mode.value==='random'?'':'none';defaults.disabled=!mode.value;}
+      c.mark=function(){c.dirty=true;message.textContent='有未保存的修改';visibility();};
+      card.addEventListener('input',c.mark);card.addEventListener('change',c.mark);visibility();
+      save.onclick=function(){
+        var count=Number(random.value);
+        if(mode.value==='random'&&(!Number.isInteger(count)||count<1||count>99)){toast('随机候选数量须为 1–99 的整数','err');return;}
+        var patch=preferredPayload(list.value);patch.optimizer={subMode:mode.value,subIncludeDefault:!!mode.value&&defaults.value==='1',subRandomCount:count||16};
+        if(b.lines.length&&!patch.preferredIPs.length&&!patch.preferredDomains&&!confirm('此操作会清空后端'+(b.index+1)+'的优选列表，是否继续？'))return;
+        c.saving=true;save.disabled=true;mode.disabled=true;defaults.disabled=true;list.disabled=true;random.disabled=true;message.textContent='正在保存…';
+        api('config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)},b.url).then(function(r){
+          if(!r||!r.ok)throw new Error(r&&r.msg||'保存失败');
+          c.dirty=false;b.lines=list.value.split(/\\n+/).filter(function(s){return s.trim();});b.subMode=mode.value;b.includeDefault=patch.optimizer.subIncludeDefault;
+          title.textContent='后端'+(b.index+1)+' · '+b.lines.length+' 条配置地址';
+          if(CFG&&b.url===window.CFN_CONFIG_BACKEND){CFG.preferredDomains=patch.preferredDomains;CFG.preferredIPs=patch.preferredIPs;Object.assign(CFG.optimizer||(CFG.optimizer={}),patch.optimizer);onSubMode();}
+          message.textContent='已保存：'+new Date().toLocaleTimeString();toast('后端'+(b.index+1)+'优选配置已保存','ok');makeSub(false);
+          var total=preferredCards.reduce(function(n,x){return n+x.backend.lines.length;},0);summary.textContent='已读取 '+success.length+'/'+rBackendCount+' 个后端，共 '+total+' 条配置地址；各后端独立保存，以订阅预览为准。';
+        }).catch(function(e){message.textContent='保存失败：'+e.message+'；修改已保留，可重试。';toast(message.textContent,'err');}).then(function(){c.saving=false;save.disabled=false;mode.disabled=false;list.disabled=false;random.disabled=false;visibility();});
+      };
+      wrap.appendChild(card);
+    });
+    var rBackendCount=r.backends.length;
+    target.value=preferredCards.some(function(c){return c.backend.url===previous;})?previous:(preferredCards.some(function(c){return c.backend.url===window.CFN_CONFIG_BACKEND;})?window.CFN_CONFIG_BACKEND:(preferredCards[0]?preferredCards[0].backend.url:''));
+  }).catch(function(e){summary.textContent='各后端配置读取失败：'+e.message+'。现有修改已保留。';});
+}
 function loadAll(){
   updateFreeDomainWarn();
+  loadPreferredOverview();
   api('status').then(function(r){
     if (r && r.ok) renderStatus(r.data);
   }).catch(function(){});
@@ -2118,6 +2176,7 @@ function loadAll(){
       fillForm();
       renderAll();
       applyMode();
+      if (curMode()==='worker' && (location.hash==='#optimizer' || new URLSearchParams(location.search).get('v')==='optimizer')) switchView('optimizer');
       if (!CFG.mode) showMode();
       makeSub(false);
       setConn(true);
@@ -2273,15 +2332,6 @@ function parseIps(t){
   });
   return out;
 }
-function renderPreferred(){
-  if (!CFG) return;
-  var lines = [];
-  String(CFG.preferredDomains || '').split(/[\\n;]+/).map(function(s){ return s.trim(); }).filter(Boolean).forEach(function(s){ lines.push(s); });  // URL 感知：含查询串逗号的 URL 整行保留，不按逗号切碎
-  (CFG.preferredIPs || []).forEach(function(x){
-    lines.push((String(x.ip).indexOf(':') >= 0 ? '[' + x.ip + ']' : x.ip) + ':' + (x.port || 443) + (x.name ? ('#' + x.name) : ''));
-  });
-  $('f-preferred').value = lines.join('\\n');
-}
 function fillPort(pv){
   pv = String(pv == null ? 443 : pv);
   var sel = $('o-port');
@@ -2332,9 +2382,6 @@ function fillForm(){
   $('o-count').value = o.count || 20;
   $('o-fill').value = (o.fillCount == null ? 0 : o.fillCount);
   $('o-useCidr').checked = o.useCidr !== false;
-  $('o-submode').value = o.subMode || '';
-  $('o-subinc').value = (o.subIncludeDefault ? '1' : '0');
-  $('o-rand').value = o.subRandomCount == null ? 16 : o.subRandomCount;
   $('q-nl-on').checked = !!CFG.nodeLimit;
   $('q-nl-count').value = CFG.nodeLimitCount || 300;
   $('q-cpu-on').checked = !!CFG.cpuLimit;
@@ -2360,7 +2407,6 @@ function fillForm(){
   $('x-conf').value = CFG.masqueConf || '';
   $('x-name').value = CFG.masqueName || 'MASQUE';
   $('x-eps').value = CFG.masqueEps || '';
-  renderPreferred();
   bindRegionPills();
   onSubMode();
   $('o-customWrap').style.display = ($('o-source').value === 'custom') ? '' : 'none';
@@ -2384,24 +2430,6 @@ function bindRegionPills(){
 }
 function collectForm(){
   if (!CFG) return null;
-  var ipLines = [], domLines = [];
-  // URL 感知收集：URL（含 ://）整行原样保留（查询串自带逗号不打碎，如 ?region=NL,GB,FI）；
-  // 非 URL 行仍支持逗号/分号分隔多条 IP（兼容 "1.2.3.4:443#名, 5.6.7.8" 旧用法）
-  String($('f-preferred').value).split(/\\n+/).map(function(s){ return s.trim(); }).filter(Boolean).forEach(function(s){
-    if (s.indexOf('://') >= 0){ domLines.push(s); return; }
-    s.split(/[;,]+/).map(function(x){ return x.trim(); }).filter(Boolean).forEach(function(x){
-      if (parseIps(x).length) ipLines.push(x); else domLines.push(x);
-    });
-  });
-  var ips = [], seen = {};
-  ipLines.forEach(function(s){
-    var p = parseIps(s);
-    if (!p.length) return;
-    var k = p[0].ip + ':' + (p[0].port || 443);
-    if (seen[k]) return;
-    seen[k] = 1;
-    ips.push(p[0]);
-  });
   return {
     mode: $('a-mode').value || '',
     warpFront: (($('a-front') || {}).value || '').trim(),
@@ -2440,8 +2468,6 @@ function collectForm(){
     proxyIP: $('s-proxyIP').value.trim(),
     outboundProxy: $('s-outbound').value.trim(),
     outboundMode: $('s-outmode').value,
-    preferredDomains: domLines.join('\\n'),
-    preferredIPs: ips,
     optimizer: {
       source: $('o-source').value,
       sourceURL: $('o-sourceURL').value.trim(),
@@ -2451,9 +2477,9 @@ function collectForm(){
       count: parseInt($('o-count').value) || 20,
       fillCount: parseInt($('o-fill').value) || 0,
       useCidr: $('o-useCidr').checked,
-      subMode: $('o-submode').value,
-      subRandomCount: parseInt($('o-rand').value) || 16,
-      subIncludeDefault: $('o-subinc').value === '1'
+      subMode: $('fl-custom-pref').checked ? 'custom' : ($('fl-random-pref').checked ? 'random' : ''),
+      subRandomCount: (CFG.optimizer||{}).subRandomCount || 16,
+      subIncludeDefault: !!(CFG.optimizer||{}).subIncludeDefault
     },
     filter: {
       region: (function(){
@@ -2474,6 +2500,7 @@ function collectForm(){
   };
 }
 function saveAll(){
+  if(hasPreferredDrafts()){toast('请先用各后端卡片内的按钮保存优选修改','warn');return;}
   if (!CFG){ toast('配置尚未加载', 'err'); return; }
   var body = collectForm();
   var btn = $('saveBtn');
@@ -2685,52 +2712,12 @@ function onPortSel(){
   c.style.display = sel.value === 'custom' ? '' : 'none';
 }
 function onSubMode(){
-  var m = $('o-submode').value;
-  $('sm-custom').style.display = (m === 'custom') ? '' : 'none';
-  $('sm-random').style.display = (m === 'random') ? '' : 'none';
-  // 「追加内置优选池与默认地区源」仅在自定义订阅 / 随机优选模式下可选；
-  // 订阅模式关闭（使用面板默认节点池）时强制为关闭并禁用，避免默认模式下误开追加导致行为不符
-  if (m === '') {
-    $('o-subinc').value = '0';
-    $('o-subinc').disabled = true;
-  } else {
-    $('o-subinc').disabled = false;
-  }
-  // 订阅模式与仪表盘「地址来源」胶囊互斥同步（三态全部明确跟随）：
-  // custom → 自定义优选开、随机优选关；random → 随机优选开、自定义优选关；关闭 → 两个胶囊都关
-  if (m === 'custom') {
-    $('fl-custom-pref').checked = true;
-    $('fl-random-pref').checked = false;
-  } else if (m === 'random') {
-    $('fl-custom-pref').checked = false;
-    $('fl-random-pref').checked = true;
-  } else {
-    $('fl-custom-pref').checked = false;
-    $('fl-random-pref').checked = false;
-  }
+  var mode=(CFG&&CFG.optimizer||{}).subMode;
+  $('fl-custom-pref').checked=mode==='custom';
+  $('fl-random-pref').checked=mode==='random';
 }
-// 仪表盘「地址来源 → 自定义优选」与优选配置「订阅模式」联动：
-// 勾选 → 订阅模式切为「自定义订阅（支持汇聚）」并关闭随机优选；取消 → 订阅模式关闭（使用面板默认节点池）
-$('fl-custom-pref').addEventListener('change', function(){
-  if (this.checked) {
-    $('fl-random-pref').checked = false;   // 与随机优选互斥
-    $('o-submode').value = 'custom';
-  } else {
-    if ($('o-submode').value === 'custom') $('o-submode').value = '';
-  }
-  onSubMode();
-});
-// 仪表盘「地址来源 → 随机优选」与优选配置「订阅模式 → 随机候选模式（未测速）」联动：
-// 勾选 → 订阅模式切为 random 并关闭自定义优选；取消 → 订阅模式关闭（若当前为 random）
-$('fl-random-pref').addEventListener('change', function(){
-  if (this.checked) {
-    $('fl-custom-pref').checked = false;   // 与自定义优选互斥
-    $('o-submode').value = 'random';
-  } else {
-    if ($('o-submode').value === 'random') $('o-submode').value = '';
-  }
-  onSubMode();
-});
+$('fl-custom-pref').addEventListener('change',function(){if(this.checked)$('fl-random-pref').checked=false;});
+$('fl-random-pref').addEventListener('change',function(){if(this.checked)$('fl-custom-pref').checked=false;});
 $('o-source').addEventListener('change', function(){
   $('o-customWrap').style.display = ($('o-source').value === 'custom') ? '' : 'none';
 });
@@ -2831,7 +2818,8 @@ function renderResults(list){
 function useIp(i){
   var r = LAST[i];
   if (!r) return;
-  var ta = $('f-preferred');
+  var c=preferredTarget();if(!c){toast('请先选择可用的目标后端','warn');return;}if(c.saving){toast('请等待后端保存完成','warn');return;}
+  var ta=c.list;
   var line = r.ip + ':' + r.port + (r.name ? ('#' + r.name) : '');
   var exists = false;
   String(ta.value || '').split(/[\\n,;]+/).forEach(function(s){
@@ -2841,8 +2829,8 @@ function useIp(i){
   if (exists){ toast('该 IP 已在优选列表中', 'warn'); return; }
   var s = ta.value.trim();
   ta.value = s ? (s + '\\n' + line) : line;
-  markDirty();
-  toast('已加入优选列表，点击「保存全部」下发', 'ok');
+  c.mode.value='custom';c.mark();
+  toast('已加入后端'+(c.backend.index+1)+'，点击卡片内的保存按钮生效','ok');
 }
 function addAllBest(){
   var n = parseInt($('o-count').value) || 20;
@@ -2857,17 +2845,10 @@ function addAllBest(){
   var arr = [];
   // 保留原节点名：防地区信息丢失导致订阅无国家显示；无名条目才编「优选N」
   list.forEach(function(r, i){ arr.push(r.ip + ':' + r.port + (r.name ? ('#' + r.name) : ('#优选' + (i + 1)))); });
-  $('f-preferred').value = arr.join('\\n');
-  markDirty();
-  toast('已加入最快的 ' + list.length + ' 个优选 IP，点击「保存全部」下发', 'ok');
+  var c=preferredTarget();if(!c){toast('请先选择可用的目标后端','warn');return;}if(c.saving){toast('请等待后端保存完成','warn');return;}
+  c.list.value=arr.join('\\n');c.mode.value='custom';c.mark();
+  toast('已加入后端'+(c.backend.index+1)+'，点击卡片内的保存按钮生效','ok');
 }
-function fetchDomains(){
-  api('domains').then(function(r){
-    if (r && r.ok && r.data && r.data.length){ $('f-preferred').value = r.data.join('\\n'); markDirty(); toast('已拉取优选域名', 'ok'); }
-    else toast((r && r.msg) || '拉取失败', 'err');
-  }).catch(function(){ toast('拉取失败：无法连接服务器', 'err'); });
-}
-
 /* ===== 启动 ===== */
 buildNav();
 var initView = 'dashboard';
@@ -2875,6 +2856,7 @@ try {
   var qv = new URLSearchParams(location.search).get('v');
   if (qv && TITLES[qv]) initView = qv;
 } catch(e) {}
+if(location.hash==='#optimizer') initView='optimizer';
 switchView(initView);
 loadAll();
 
@@ -2928,8 +2910,10 @@ function clearAuthCookie(headers) {
 }
 
 // 面板 HTML 注入：①「管理密码」字段改为修改前端登录密码 ②注入「多后端管理」模块
-function buildPanelHtml({ backends, sel, multi, balance, origin, adminFromEnv, sharedApi }) {
+function buildPanelHtml({ backends, sel, multi, balance, origin, adminFromEnv, sharedApi, configBackendIndex = sel }) {
   let html = PANEL_HTML;
+  const configContext = JSON.stringify(backends[configBackendIndex]?.url || "").replace(/</g, "\\u003c");
+  html = html.replace("<head>", "<head><script>window.CFN_CONFIG_BACKEND=" + configContext + ";window.CFN_CONFIG_BACKEND_INDEX=" + (configBackendIndex || 0) + ";<\/script>");
 
   // ① a-admin 字段改写：提示改为「前端登录密码」，值不再进后端 config（collectForm 里 admin 字段被禁写）
   html = html.replace(
@@ -2993,7 +2977,7 @@ function injectBeModule({ backends, sel, multi, balance, origin, adminFromEnv, s
   return `<div class="card" id="beCard">
         <h3><span class="tick"></span>多后端管理</h3>
         <p class="hint" style="margin-top:0;margin-bottom:8px">每行一个后端，格式 <code>名称:地址,API,UUID</code>（前两段必填，后两段可省略）；也兼容冒号老写法 <code>名称:地址:API[:UUID]</code>（从右侧识别，不会误伤地址里的 <code>://</code> 与端口）。<br>
-          · <b>名称</b>：自定义；开启多订阅聚合时作为该后端节点的名前缀（如 <code>hka·香港-01</code>）。<br>
+          · <b>名称</b>：用于管理列表；订阅保留各节点自己的名称，仅重名时补充后端编号。<br>
           · <b>地址</b>：该后端 Worker 的完整地址，如 <code>https://v1.xxx.workers.dev</code>。<br>
           · <b>API</b>：该后端自己的访问密钥，要与那个后端 Worker 的 <code>API</code> 环境变量一致；留空则回落到本前端的环境变量 <code>API</code>（两者都没配、而后端又设了密钥时，该后端会连不上）。<br>
           · <b>UUID</b>：该后端在订阅/接口路径里的映射段，<b>可留空</b> —— 留空依次回落到本前端的环境变量 <code>U</code>，再没有就用固定段 <code>cf</code>。后端<b>只认 API 密钥、不校验这里的 UUID</b>，所以填不填、填什么都可用，多个后端各填各的、互不影响。<br>
@@ -3100,6 +3084,7 @@ function injectBeModule({ backends, sel, multi, balance, origin, adminFromEnv, s
           if(saveAll.__beHooked) return;
           var orig = saveAll;
           function wrapped(){
+            if(typeof hasPreferredDrafts==='function'&&hasPreferredDrafts()){toast('请先用各后端卡片内的按钮保存优选修改','warn');return;}
             var list=parseLines();
             if(!list) return;
             // 【不做】「基础配置 UUID → 同步到当前行」：每行手填的 UUID 才是权威。
@@ -3824,6 +3809,9 @@ export default {
       if (!ok) return P(LOGIN_PAGE);
       const bl = await parseBackends(env);
       const bc = await parseBecfg(env, bl.length || 1);
+      const requestedBackend = u.searchParams.get("backend");
+      const configBackendIndex = requestedBackend == null ? bc.sel : bl.findIndex((b) => b.url === requestedBackend);
+      if (requestedBackend != null && configBackendIndex < 0) return J({ ok: false, msg: "此后端已不存在，请从面板入口重新选择" }, 400);
       return P(
         buildPanelHtml({
           backends: bl,
@@ -3833,6 +3821,7 @@ export default {
           origin: u.origin,
           adminFromEnv: !!envAdmin,
           sharedApi: String(env.API || env.GATE || "").trim(),
+          configBackendIndex,
         }),
       );
     }
@@ -3851,6 +3840,10 @@ export default {
     // ---- 多后端管理接口（需登录）----
     const backends = await parseBackends(env);
     const becfg = await parseBecfg(env, backends.length || 1);
+    const configTarget = () => {
+      const target = request.headers.get("x-cfnext-config-backend");
+      return target ? backends.find((b) => b.url === target) : backends[becfg.sel];
+    };
     if (u.pathname === "/quota-accounts" || u.pathname === "/quota-accounts/check") {
       const denied = gate();
       if (denied) return denied;
@@ -3872,6 +3865,35 @@ export default {
       ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket" || /\/sub\//.test(u.pathname))
     ) {
       ctx.waitUntil(refreshQuotaAccounts(env).catch(() => {}));
+    }
+    if (u.pathname === "/preferred-backends") {
+      const denied = gate();
+      if (denied) return denied;
+      if (request.method !== "GET") return J({ ok: false, msg: "仅支持读取" }, 405);
+      const lists = await Promise.all(backends.map(async (b, index) => {
+        const row = { index, url: b.url, lines: [], subMode: "", includeDefault: false, randomCount: 16 };
+        try {
+          const headers = buildHeaders(new Request("https://local/", { headers: { "User-Agent": "Mozilla/5.0" } }), b.api);
+          headers.set("x-cf-host", u.hostname);
+          const response = await fetch(b.url + "/" + mappingSeg(b) + "/api/config", { headers, signal: AbortSignal.timeout(10000) });
+          if (!response.ok) return { ...row, error: "HTTP " + response.status };
+          const body = await response.json();
+          if (!body.ok || !body.data) return { ...row, error: "配置读取失败" };
+          const cfg = body.data;
+          row.lines = String(cfg.preferredDomains || "").split(/[\n;]+/).map((s) => s.trim()).filter(Boolean);
+          for (const ip of Array.isArray(cfg.preferredIPs) ? cfg.preferredIPs : []) {
+            if (!ip || typeof ip.ip !== "string") continue;
+            row.lines.push((ip.ip.includes(":") ? "[" + ip.ip + "]" : ip.ip) + ":" + (ip.port || 443) + (ip.name ? "#" + ip.name : ""));
+          }
+          row.subMode = cfg.optimizer?.subMode || "";
+          row.includeDefault = !!cfg.optimizer?.subIncludeDefault;
+          row.randomCount = cfg.optimizer?.subRandomCount || 16;
+          return row;
+        } catch (_) {
+          return { ...row, error: "暂时无法读取此后端，请稍后刷新" };
+        }
+      }));
+      return J({ ok: true, multi: becfg.multi, backends: lists });
     }
     if (u.pathname === "/backends") {
       const d = gate();
@@ -3994,8 +4016,10 @@ export default {
     if (entryPath && u.pathname === entryPath + "/api/reset" && request.method === "POST") {
       const d = gate();
       if (d) return d;
+      const target = configTarget();
+      if (!target) return J({ ok: false, msg: "编辑后端已不存在，请重新载入面板" }, 400);
       try {
-        await proxyFailover(request, backends, becfg.sel, u.pathname, u.search, entry, env, becfg.multi && becfg.balance);
+        await proxyFailover(request, [target], 0, u.pathname, u.search, entry, env, false);
       } catch (_) {}
       try {
         if (env.K && typeof env.K.delete === "function") await env.K.delete("admin");
@@ -4065,7 +4089,10 @@ export default {
       if (d) return d;
     }
     try {
-      return await proxyFailover(request, backends, becfg.sel, u.pathname, u.search, entry, env, becfg.multi && becfg.balance);
+      const management = entryPath && u.pathname.startsWith(entryPath + "/api/");
+      const target = management ? configTarget() : null;
+      if (management && !target) return J({ ok: false, msg: "编辑后端已不存在，请重新载入面板" }, 400);
+      return await proxyFailover(request, target ? [target] : backends, target ? 0 : becfg.sel, u.pathname, u.search, entry, env, !management && becfg.multi && becfg.balance);
     } catch (e) {
       return new Response("backend unreachable: " + ((e && e.message) || e), {
         status: 502,
@@ -4188,6 +4215,7 @@ const MULTI_QUOTA_SCRIPT = `<script>
   var originalSaveAll=window.saveAll;
   if(typeof originalSaveAll==='function'){
     window.saveAll=function(){
+      if(typeof hasPreferredDrafts==='function'&&hasPreferredDrafts()){if(window.toast)window.toast('请先用各后端卡片内的按钮保存优选修改','warn');return;}
       var self=this,args=arguments;
       if(!dirty)return originalSaveAll.apply(self,args);
       return saveQuotaSettings().then(function(){return originalSaveAll.apply(self,args);})
