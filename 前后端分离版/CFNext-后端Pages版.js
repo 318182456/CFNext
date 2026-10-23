@@ -1426,6 +1426,59 @@ function jsonResponse(data, status) {
     },
   });
 }
+// 只缓存 KV 原始字符串；每个请求仍创建独立配置，避免请求间共享可变对象。
+const backendConfigCache = new WeakMap();
+async function readBackendConfigValue(env, force = false) {
+  const store = env.K;
+  if (!store || typeof store.get !== "function") return null;
+  const previous = backendConfigCache.get(store);
+  if (previous?.pending) {
+    if (!force) return previous.pending;
+    await previous.pending;
+    return readBackendConfigValue(env, true);
+  }
+  if (!force && previous && Date.now() < previous.expiresAt) {
+    if (previous.error && !previous.hasValue) throw previous.error;
+    return previous.value;
+  }
+  const entry = {};
+  backendConfigCache.set(store, entry);
+  entry.pending = Promise.resolve().then(() => store.get("config", { cacheTtl: 30 })).then(
+    (value) => {
+      if (backendConfigCache.get(store) === entry)
+        backendConfigCache.set(store, { value, hasValue: true, expiresAt: Date.now() + 300000 });
+      return value;
+    },
+    (error) => {
+      const fallback = { value: previous?.value, hasValue: !!previous?.hasValue, error, expiresAt: Date.now() + 30000 };
+      if (backendConfigCache.get(store) === entry) backendConfigCache.set(store, fallback);
+      // 已加载过的配置在 KV 临时故障时继续复用；管理写入前强制读取时不隐藏错误。
+      if (!force && fallback.hasValue) return fallback.value;
+      throw error;
+    },
+  );
+  return entry.pending;
+}
+async function writeBackendConfigValue(env, value) {
+  const store = env.K;
+  const previous = backendConfigCache.get(store);
+  if (value !== null && previous && !previous.pending && !previous.error &&
+      Date.now() < previous.expiresAt && previous.value === value) return;
+  const entry = {};
+  backendConfigCache.set(store, entry);
+  entry.pending = Promise.resolve().then(() => value === null ? store.delete("config") : store.put("config", value)).then(
+    () => {
+      if (backendConfigCache.get(store) === entry)
+        backendConfigCache.set(store, { value, hasValue: true, expiresAt: Date.now() + 300000 });
+      return value;
+    },
+    (error) => {
+      if (backendConfigCache.get(store) === entry) backendConfigCache.delete(store);
+      throw error;
+    },
+  );
+  await entry.pending;
+}
 async function loadBackendConfig(env) {
   const e = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
   let n = !1,
@@ -1458,9 +1511,7 @@ async function loadBackendConfig(env) {
     try {
       const a = await (async function (t) {
         try {
-          return await t.K.get("config", {
-            cacheTtl: 30,
-          });
+          return await readBackendConfigValue(t);
         } catch (t) {
           return null;
         }
@@ -1524,7 +1575,7 @@ async function loadBackendConfig(env) {
 async function saveBackendConfig(env, config) {
   if (!env.K || "function" != typeof env.K.put) return !1;
   const n = JSON.parse(JSON.stringify(config));
-  return (n.admin && (n.admin = String(n.admin)), await env.K.put("config", JSON.stringify(n)), !0);
+  return (n.admin && (n.admin = String(n.admin)), await writeBackendConfigValue(env, JSON.stringify(n)), !0);
 }
 let bt = null,
   It = 0;
@@ -7243,14 +7294,11 @@ export default {
             try {
               const t = await n.json();
               let e = !1;
-              if (r.K && "function" == typeof r.K.get)
-                try {
-                  const t = await r.K.get("config", {
-                    cacheTtl: 30,
-                  });
-                  t && void 0 !== JSON.parse(t).quotaAuto && (e = !0);
-                } catch (t) {}
-              const o = Object.assign(JSON.parse(JSON.stringify(h)), t);
+              if (r.K && "function" == typeof r.K.get) {
+                const stored = await readBackendConfigValue(r, true);
+                stored && void 0 !== JSON.parse(stored).quotaAuto && (e = !0);
+              }
+              const o = Object.assign(await loadBackendConfig(r), t);
               ("home" === String(o.mode || "").toLowerCase() ? (o.homeWan = !0) : (o.homeWan = !1),
                 e ||
                   !1 !== o.quotaAuto ||
@@ -7297,7 +7345,7 @@ export default {
                 },
                 400,
               );
-            await r.K.delete("config");
+            await writeBackendConfigValue(r, null);
             const t = AUTH_COOKIE_NAME + "=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax";
             return new Response(
               JSON.stringify({

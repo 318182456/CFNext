@@ -10,6 +10,7 @@
  *   API      密钥兜底（某行没单独填密钥时用它；兼容旧 GATE / BACKEND_GATE）。
  *   U        映射段兜底（兼容旧 UUID / BACKEND_UUID）：某行没填 UUID 时用它，再没有用 cf。
  *   ADMIN    可选。强制前端登录密码（设置后面板内改密码无效）。
+ *   BECFG    可选。KV 暂不可读时的切换设置 JSON 兜底，正常情况下仍以面板保存值为准。
  *
  * 后端不再校验路径 UUID：前端把 /<L>/api|sub/* 映射到 /<映射段>/*（映射段 = 该行 UUID
  * → env U → cf），后端只要收到正确的 API 密钥就放行任意 UUID。
@@ -132,6 +133,82 @@ function hashPwd(p) {
 }
 const AC = "cfn_auth";
 
+// 缓存仅在当前边缘实例内复用；其它实例通过 TTL 重新加载。
+// 合并并发读取，保存时更新缓存，防止旧的在途读取覆盖新设置。
+const frontendKVCache = new WeakMap();
+function frontendCache(env) {
+  if (!env.K) return null;
+  let cache = frontendKVCache.get(env.K);
+  if (!cache) frontendKVCache.set(env.K, (cache = new Map()));
+  return cache;
+}
+function frontendCacheTtl(key) {
+  return key === "admin" || key.startsWith("quota_usage:") ? 60000 : 300000;
+}
+async function readFrontendValue(env, key) {
+  if (!env.K || typeof env.K.get !== "function") return null;
+  const cache = frontendCache(env);
+  const previous = cache.get(key);
+  if (previous?.pending) return previous.pending;
+  if (previous && Date.now() < previous.expiresAt) {
+    if (previous.error) throw previous.error;
+    return previous.value;
+  }
+  if (cache.size >= 64 && !cache.has(key)) cache.delete(cache.keys().next().value);
+  const entry = {};
+  cache.set(key, entry);
+  entry.pending = Promise.resolve().then(() => env.K.get(key)).then(
+    (value) => {
+      if (cache.get(key) === entry)
+        cache.set(key, { value, expiresAt: Date.now() + frontendCacheTtl(key) });
+      return value;
+    },
+    (error) => {
+      // 超额/故障时短暂退避；错误不等同于“没有配置”。
+      if (cache.get(key) === entry) cache.set(key, { error, expiresAt: Date.now() + 30000 });
+      throw error;
+    },
+  );
+  return entry.pending;
+}
+async function writeFrontendValue(env, key, value, options) {
+  const cache = frontendCache(env);
+  const previous = cache.get(key);
+  if (!options && previous && !previous.pending && !previous.error &&
+      Date.now() < previous.expiresAt && previous.value === value) return;
+  const entry = {};
+  cache.set(key, entry);
+  entry.pending = Promise.resolve().then(() => env.K.put(key, value, options)).then(
+    () => {
+      if (cache.get(key) === entry)
+        cache.set(key, { value, expiresAt: Date.now() + frontendCacheTtl(key) });
+      return value;
+    },
+    (error) => {
+      if (cache.get(key) === entry) cache.delete(key);
+      throw error;
+    },
+  );
+  await entry.pending;
+}
+async function deleteFrontendValue(env, key) {
+  const cache = frontendCache(env);
+  const entry = {};
+  cache.set(key, entry);
+  entry.pending = Promise.resolve().then(() => env.K.delete(key)).then(
+    () => {
+      if (cache.get(key) === entry)
+        cache.set(key, { value: null, expiresAt: Date.now() + frontendCacheTtl(key) });
+      return null;
+    },
+    (error) => {
+      if (cache.get(key) === entry) cache.delete(key);
+      throw error;
+    },
+  );
+  await entry.pending;
+}
+
 // 规范化单个后端条目（补 name，api/uuid 只保留「显式填写」的值）
 // 关键：这里**不**把环境变量 API/U 固化进条目 —— 它们由 parseBackends 在运行期兜底，
 // 否则存进 KV 后会盖住以后对 env 的修改（改了 env 却不生效）。
@@ -150,6 +227,42 @@ function normBackend(it) {
   };
 }
 
+// 项目重建时只映射退役地址，避免 KV 当日超额期间无法保存新地址。
+// 不固定后端数量；正常保存新列表后，已无旧地址的条目不受影响。
+let backendReplacementCache = { source: "", value: {} };
+function backendReplacements(env) {
+  // 每次迁移使用独立的加密变量，后续重建不必读取或覆盖其它已隐藏的密钥。
+  const entries = Object.keys(env).filter((key) => key.startsWith("BACKEND_REPLACE_")).sort().map((key) => env[key]);
+  const base = String(env.BACKEND_REPLACEMENTS || "").trim();
+  const source = JSON.stringify([base, entries]);
+  if (backendReplacementCache.source !== source) {
+    const value = base ? JSON.parse(base) : {};
+    if (!value || Array.isArray(value) || typeof value !== "object") throw new Error("Invalid backend replacements");
+    for (const raw of entries) {
+      const { from, ...replacement } = JSON.parse(raw);
+      if (typeof from !== "string" || !/^https:\/\//i.test(from)) throw new Error("Invalid retired backend URL");
+      value[from.replace(/\/+$/, "")] = replacement;
+    }
+    backendReplacementCache = { source, value };
+  }
+  return backendReplacementCache.value;
+}
+function remapBackend(env, it) {
+  let backend = normBackend(it);
+  if (!backend) return null;
+  const replacements = backendReplacements(env);
+  const visited = new Set();
+  while (replacements[backend.url]) {
+    if (visited.has(backend.url)) throw new Error("Backend replacement cycle");
+    visited.add(backend.url);
+    const replacement = replacements[backend.url];
+    if (typeof replacement.url !== "string" || !/^https:\/\//i.test(replacement.url))
+      throw new Error("Invalid replacement backend URL");
+    backend = normBackend({ ...backend, ...replacement });
+  }
+  return backend;
+}
+
 // 解析后端列表：优先前端 KV（K.backends），其次 env BACKENDS（JSON 数组），最后 URL 单后端
 // 环境变量简写：URL=BACKEND_URL、API=GATE=BACKEND_GATE、U=BACKEND_UUID（旧名仍兼容）
 // 密钥优先级：后端条目自带的 api > 环境变量 API（共享兜底）> 无（未配置 ⇒ 后端 fail-open）
@@ -162,7 +275,7 @@ async function parseBackends(env) {
   const norm = (arr) => {
     const out = [];
     for (const it of arr) {
-      const b = normBackend(it);
+      const b = remapBackend(env, it);
       if (!b) continue;
       if (b.api) b.apiExplicit = true;
       else b.api = sharedApi; // 没单独填密钥 ⇒ 用环境变量里的共享密钥
@@ -175,7 +288,7 @@ async function parseBackends(env) {
   // 1) 前端 KV 里持久化的后端列表（面板「多后端管理」保存的结果）优先
   try {
     if (env.K && typeof env.K.get === "function") {
-      const kvRaw = await env.K.get("backends");
+      const kvRaw = await readFrontendValue(env, "backends");
       if (kvRaw) {
         const kvList = norm(JSON.parse(kvRaw));
         if (kvList.length) return kvList;
@@ -206,10 +319,7 @@ async function parseBackends(env) {
   if (base) {
     return [
       {
-        name: base.replace(/^https?:\/\//i, "").split(".")[0],
-        url: base,
-        api: sharedApi,
-        uuid: "",
+        ...remapBackend(env, { url: base, api: sharedApi }),
         envUuid,
       },
     ];
@@ -224,16 +334,19 @@ async function parseBecfg(env, len) {
     multi: false,
     balance: false,
   };
+  const apply = (o) => {
+    if (!o || typeof o !== "object") return;
+    if (Number.isInteger(o.sel)) cfg.sel = o.sel;
+    if (typeof o.multi === "boolean") cfg.multi = o.multi;
+    if (typeof o.balance === "boolean") cfg.balance = o.balance;
+  };
+  try { apply(JSON.parse(env.BECFG || "null")); } catch (_) {}
   try {
     if (env.K && typeof env.K.get === "function") {
-      const raw = await env.K.get("becfg");
+      const raw = await readFrontendValue(env, "becfg");
       if (raw) {
         const o = JSON.parse(raw);
-        if (o && typeof o === "object") {
-          if (Number.isInteger(o.sel)) cfg.sel = o.sel;
-          if (typeof o.multi === "boolean") cfg.multi = o.multi;
-          if (typeof o.balance === "boolean") cfg.balance = o.balance;
-        }
+        apply(o);
       }
     }
   } catch (_) {
@@ -570,10 +683,10 @@ async function saveBackends(request, env) {
     );
   }
   try {
-    await env.K.put("backends", JSON.stringify(clean));
+    await writeFrontendValue(env, "backends", JSON.stringify(clean));
     // 选中索引收敛到新列表范围
     const cfg = await parseBecfg(env, clean.length);
-    await env.K.put("becfg", JSON.stringify(cfg));
+    await writeFrontendValue(env, "becfg", JSON.stringify(cfg));
     return new Response(
       JSON.stringify({
         ok: true,
@@ -648,7 +761,8 @@ async function saveBecfg(request, env, len) {
   const previous = await parseBecfg(env, len);
   const balance = typeof body.balance === "boolean" ? body.balance : previous.balance;
   try {
-    await env.K.put(
+    await writeFrontendValue(
+      env,
       "becfg",
       JSON.stringify({
         sel,
@@ -2878,12 +2992,8 @@ bindGlass();
 async function readAdmin(env) {
   const envAdmin = String(env.ADMIN || "").trim();
   if (envAdmin) return envAdmin;
-  try {
-    if (env.K && typeof env.K.get === "function") {
-      const kv = await env.K.get("admin");
-      if (kv) return String(kv);
-    }
-  } catch (_) {}
+  const kv = await readFrontendValue(env, "admin");
+  if (kv) return String(kv);
   return "";
 }
 
@@ -3318,6 +3428,7 @@ const QUOTA_INTERVAL = 15 * 60 * 1000;
 const quotaCache = new Map();
 const quotaPending = new Map();
 let quotaAccountCache = null;
+let quotaRefreshState = null;
 function quotaJson(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -3328,23 +3439,32 @@ function quotaJson(data, status = 200) {
   });
 }
 async function readQuotaAccounts(env) {
+  const replacements = backendReplacements(env);
   if (
     quotaAccountCache &&
     quotaAccountCache.env === env.QUOTA_ACCOUNTS &&
-    Date.now() - quotaAccountCache.at < 30000
+    quotaAccountCache.replacements === replacements &&
+    quotaAccountCache.store === env.K &&
+    Date.now() - quotaAccountCache.at < 300000
   )
     return quotaAccountCache.accounts;
   let raw;
   try {
-    raw = await env.K?.get("quota_accounts");
+    raw = await readFrontendValue(env, "quota_accounts");
   } catch (_) {
     raw = null;
   }
   if (!raw) raw = env.QUOTA_ACCOUNTS || "[]";
-  const accounts = JSON.parse(raw);
+  let accounts = JSON.parse(raw);
   if (!Array.isArray(accounts)) throw new Error("Invalid quota account configuration");
+  accounts = accounts.map((account) => ({
+    ...account,
+    backends: (account.backends || []).map((url) => remapBackend(env, { url })?.url || url),
+  }));
   quotaAccountCache = {
     env: env.QUOTA_ACCOUNTS,
+    store: env.K,
+    replacements,
     at: Date.now(),
     accounts,
   };
@@ -3352,13 +3472,19 @@ async function readQuotaAccounts(env) {
 }
 async function quotaSnapshot(env, account) {
   const cached = quotaCache.get(account.id);
-  if (cached && cached.token === account.token && Date.now() - cached.loadedAt < 30000) return cached;
-  let data = null;
+  const sameAccount = cached && cached.store === env.K && cached.token === account.token;
+  if (sameAccount && Date.now() - cached.loadedAt < 60000) return cached;
+  // 写入失败或边缘副本尚未更新时，不让空值/旧快照覆盖刚查到的用量。
+  let data = sameAccount ? cached.data : null;
   try {
-    const raw = await env.K?.get("quota_usage:" + account.id);
-    if (raw) data = JSON.parse(raw);
+    const raw = await readFrontendValue(env, "quota_usage:" + account.id);
+    if (raw) {
+      const stored = JSON.parse(raw);
+      if (stored && (!data || Number(stored.checkedAt || 0) > Number(data.checkedAt || 0))) data = stored;
+    }
   } catch (_) {}
   const result = {
+    store: env.K,
     token: account.token,
     data,
     loadedAt: Date.now(),
@@ -3444,13 +3570,18 @@ async function queryQuotaAccount(env, account, force = false) {
       };
     }
     quotaCache.set(account.id, {
+      store: env.K,
       token: account.token,
       data: result,
       loadedAt: now,
     });
-    await env.K?.put("quota_usage:" + account.id, JSON.stringify(result), {
-      expirationTtl: 172800,
-    });
+    try {
+      if (env.K) await writeFrontendValue(env, "quota_usage:" + account.id, JSON.stringify(result), {
+        expirationTtl: 172800,
+      });
+    } catch (_) {
+      result.persistenceWarning = "本次结果保存失败，暂存于当前服务实例；切换网络后可能暂时看不到此结果。";
+    }
     return result;
   })();
   quotaPending.set(account.id, task);
@@ -3461,8 +3592,23 @@ async function queryQuotaAccount(env, account, force = false) {
   }
 }
 async function refreshQuotaAccounts(env) {
-  const accounts = await readQuotaAccounts(env);
-  await Promise.all(accounts.map((account) => queryQuotaAccount(env, account).catch(() => {})));
+  let state = quotaRefreshState;
+  if (!state || state.store !== env.K || state.config !== env.QUOTA_ACCOUNTS) {
+    state = quotaRefreshState = { store: env.K, config: env.QUOTA_ACCOUNTS, next: 0, pending: null };
+  }
+  if (state.pending) return state.pending;
+  if (Date.now() < state.next) return;
+  // 连接只触发每实例每分钟一次的检查入口；各账号仍按原 15 分钟周期查询。
+  state.next = Date.now() + 60000;
+  state.pending = (async () => {
+    const accounts = await readQuotaAccounts(env);
+    await Promise.all(accounts.map((account) => queryQuotaAccount(env, account).catch(() => {})));
+  })();
+  try {
+    await state.pending;
+  } finally {
+    state.pending = null;
+  }
 }
 async function quotaBlockedBackends(env) {
   const blocked = new Set();
@@ -3606,8 +3752,9 @@ async function handleQuotaAccounts(request, env, backends) {
         backends: urls,
       });
     }
-    await env.K.put("quota_accounts", JSON.stringify(clean));
-    quotaAccountCache = { env: env.QUOTA_ACCOUNTS, at: Date.now(), accounts: clean };
+    await writeFrontendValue(env, "quota_accounts", JSON.stringify(clean));
+    quotaAccountCache = { env: env.QUOTA_ACCOUNTS, replacements: backendReplacements(env), store: env.K, at: Date.now(), accounts: clean };
+    quotaRefreshState = null;
     quotaCache.clear();
     return quotaJson({
       ok: true,
@@ -3649,7 +3796,18 @@ export default {
     const isEntry = !!entryPath && u.pathname === entryPath;
     const envAdmin = String(env.ADMIN || "").trim();
     // 前端登录密码：ADMIN env 强制 > KV K.admin；空串 = 从未设置过
-    const admin = await readAdmin(env);
+    const needsAdmin = isEntry ||
+      ["/backends", "/becfg", "/setpass", "/quota-accounts", "/quota-accounts/check", "/preferred-backends"].includes(u.pathname) ||
+      (entryPath && u.pathname.startsWith(entryPath + "/api/"));
+    let admin = "";
+    try {
+      if (needsAdmin) admin = await readAdmin(env);
+    } catch (_) {
+      return new Response(JSON.stringify({ ok: false, msg: "前端配置暂时无法读取，可能已达到 KV 配额。请稍后重试，原密码无需重新设置。" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Retry-After": "30" },
+      });
+    }
     const ok = authed(request, admin);
     const J = (o, st, h) =>
       new Response(JSON.stringify(o), {
@@ -3757,7 +3915,7 @@ export default {
             },
             500,
           );
-        await env.K.put("admin", pwd);
+        await writeFrontendValue(env, "admin", pwd);
         const h = setAuthCookie(
           new Headers({
             "content-type": "application/json; charset=utf-8",
@@ -3990,7 +4148,7 @@ export default {
           },
           500,
         );
-      await env.K.put("admin", pwd);
+      await writeFrontendValue(env, "admin", pwd);
       const h = setAuthCookie(
         new Headers({
           "content-type": "application/json; charset=utf-8",
@@ -4022,7 +4180,7 @@ export default {
         await proxyFailover(request, [target], 0, u.pathname, u.search, entry, env, false);
       } catch (_) {}
       try {
-        if (env.K && typeof env.K.delete === "function") await env.K.delete("admin");
+        if (env.K && typeof env.K.delete === "function") await deleteFrontendValue(env, "admin");
       } catch (_) {}
       const rh = new Headers({
         "content-type": "application/json; charset=utf-8",
@@ -4141,6 +4299,7 @@ const MULTI_QUOTA_SCRIPT = `<script>
     var output=card.querySelector('[data-result]'); output.replaceChildren();
     if(!data){output.textContent='尚未检查';return;}
     if(data.error){var error=el('div',(data.stale?'缓存数据 · ':'检查失败 · ')+data.error);error.style.color='var(--err)';output.appendChild(error);}
+    if(data.persistenceWarning)output.appendChild(el('div',data.persistenceWarning));
     if(data.requests!=null){
       output.appendChild(el('div','已用 '+Number(data.requests).toLocaleString()+' / '+Number(data.limit).toLocaleString()+' 次（'+data.percent+'%） · 剩余 '+Number(data.remaining).toLocaleString()+' 次'));
       output.appendChild(el('div','Workers '+Number(data.workers||0).toLocaleString()+' · Pages '+Number(data.pages||0).toLocaleString()+' · 更新 '+new Date(data.updatedAt).toLocaleString()));
