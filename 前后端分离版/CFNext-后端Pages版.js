@@ -2364,28 +2364,14 @@ async function Kt(t) {
   });
 }
 async function qt(t, e, n) {
-  let r = null;
-  const o = (t) => {
-      if (t && t !== r)
-        try {
-          t.close();
-        } catch (t) {}
-    },
-    a = t
+  const a = t
       ? Promise.resolve()
           .then(t)
           .then(
             (t) => (t && t.readable ? t : null),
             () => null,
           )
-      : Promise.resolve(null),
-    s =
-      e && e.length
-        ? Kt(e).then(
-            (t) => (t && t.readable ? t : null),
-            () => null,
-          )
-        : Promise.resolve(null);
+      : Promise.resolve(null);
   let i = null;
   const c = await Promise.race([
     a,
@@ -2393,10 +2379,12 @@ async function qt(t, e, n) {
       i = setTimeout(() => t("__GRACE__"), n);
     }),
   ]);
-  if ((i && (clearTimeout(i), (i = null)), c && "__GRACE__" !== c)) return ((r = c), s.then(o), r);
-  // Keep racing after the direct grace period. A slow fallback must not block
-  // a direct connection that has already opened. Kt closes the losing sockets.
-  return Kt([() => a, () => s]);
+  if (i) clearTimeout(i);
+  if (c && c !== "__GRACE__") return c;
+  // DNS resolution and fallback sockets are expensive. Start them only after
+  // direct connection failure or its grace period, never after direct success.
+  // Keep the pending direct attempt in the race; Kt closes the losing sockets.
+  return Kt([() => a, ...(e || [])]);
 }
 function te(t) {
   return !t || t.byteLength < 3 ? "unknown" : 22 === t[0] && 3 === t[1] ? "tls" : "nontls";
@@ -6660,6 +6648,50 @@ async function acquireTaskLease(t, e, n) {
     return !0;
   }
 }
+// TLS records carry their own length. Use that boundary for minimum reads so a
+// fragmented record does not create thousands of JS callbacks, while small
+// handshakes and the final record are still forwarded immediately and intact.
+async function relayOutboundStream(readable, send, onEnd, protocol) {
+  let reader, byob = false, buffer;
+  let tls = protocol === "tls", remaining = 0, headerUsed = 0;
+  const header = new Uint8Array(5);
+  try {
+    try { reader = readable.getReader({ mode: "byob" }); byob = true; buffer = new Uint8Array(65536); }
+    catch (_) { reader = readable.getReader(); }
+    for (;;) {
+      const minimum = tls ? remaining || 5 - headerUsed : 1;
+      const part = await (byob
+        ? typeof reader.readAtLeast === "function" ? reader.readAtLeast(minimum, buffer) : reader.read(buffer, { min: minimum })
+        : reader.read());
+      if (part.done) break;
+      const chunk = part.value;
+      if (chunk.byteLength) send(chunk);
+      if (tls) {
+        let offset = 0;
+        while (offset < chunk.byteLength) {
+          if (remaining) {
+            const length = Math.min(remaining, chunk.byteLength - offset);
+            remaining -= length; offset += length;
+          } else {
+            const length = Math.min(5 - headerUsed, chunk.byteLength - offset);
+            header.set(chunk.subarray(offset, offset + length), headerUsed);
+            headerUsed += length; offset += length;
+            if (headerUsed === 5) {
+              remaining = (header[3] << 8) | header[4]; headerUsed = 0;
+              if (header[0] < 20 || header[0] > 24 || header[1] !== 3 || remaining > 18432) { tls = false; break; }
+            }
+          }
+        }
+      }
+      if (byob) buffer = new Uint8Array(chunk.buffer);
+    }
+  } catch (_) {}
+  finally {
+    try { reader && reader.releaseLock(); } catch (_) {}
+    try { onEnd(); } catch (_) {}
+  }
+}
+
 export default {
   fetch: async (n, r, o) =>
     (async function (n, r) {
@@ -6996,22 +7028,11 @@ export default {
                     y._preamble && y._preamble.byteLength > 0 && d(y._preamble),
                     l && l.byteLength > f.headerLength && (await i.write(l.subarray(f.headerLength))),
                     (l = null),
-                    (async function (t, e, n) {
-                      try {
-                        for (;;) {
-                          const { done: n, value: r } = await t.read();
-                          if (n) break;
-                          e(r);
-                        }
-                      } catch (t) {}
-                      try {
-                        n && n();
-                      } catch (t) {}
-                    })(y.readable.getReader(), d, () => {
+                    relayOutboundStream(y.readable, d, () => {
                       try {
                         a.close(1e3);
                       } catch (t) {}
-                    }));
+                    }, g));
                 },
                 f = (function (t, e) {
                   if (!t) return null;

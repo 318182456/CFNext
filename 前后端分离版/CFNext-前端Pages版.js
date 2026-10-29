@@ -133,9 +133,52 @@ function hashPwd(p) {
 }
 const AC = "cfn_auth";
 
-// 缓存仅在当前边缘实例内复用；其它实例通过 TTL 重新加载。
-// 合并并发读取，保存时更新缓存，防止旧的在途读取覆盖新设置。
+// 前端配置在实例内与当前边缘节点的 Cache API 中复用，持久配置仍在 KV。
+// 合并并发读取，保存时更新两层缓存，防止旧的在途读取覆盖当前实例的新设置。
 const frontendKVCache = new WeakMap();
+const frontendSharedScopes = new Map();
+async function frontendSharedEntry(env, key) {
+  if (typeof caches === "undefined") return null;
+  try {
+    const scope = [env.CF_PAGES_PROJECT_NAME, env.ADMIN, env.API, env.BACKENDS, env.URL, env.U,
+      env.QUOTA_ACCOUNTS, env.BECFG].join("\n");
+    let digest = frontendSharedScopes.get(scope);
+    if (!digest) {
+      if (frontendSharedScopes.size > 4) frontendSharedScopes.clear();
+      digest = crypto.subtle.digest("SHA-256", new TextEncoder().encode(scope)).then(
+        (bytes) => Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join(""),
+      );
+      frontendSharedScopes.set(scope, digest);
+    }
+    return {
+      cache: await caches.open("cfnext-config-v1"),
+      request: new Request("https://cfnext-cache.invalid/" + await digest + "/" + encodeURIComponent(key)),
+    };
+  } catch (_) { return null; }
+}
+async function readFrontendShared(env, key) {
+  try {
+    const entry = await frontendSharedEntry(env, key);
+    const response = entry && await entry.cache.match(entry.request);
+    if (!response) return { hit: false };
+    const data = await response.json();
+    return data.expiresAt > Date.now() ? { hit: true, value: data.value } : { hit: false };
+  } catch (_) { return { hit: false }; }
+}
+async function cacheFrontendShared(env, key, value) {
+  try {
+    const entry = await frontendSharedEntry(env, key);
+    if (!entry) return;
+    const ttl = frontendCacheTtl(key);
+    await entry.cache.put(entry.request, new Response(JSON.stringify({ value, expiresAt: Date.now() + ttl }), {
+      headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=" + Math.floor(ttl / 1000) },
+    }));
+  } catch (_) {}
+}
+async function cacheFrontendOnly(env, key, value) {
+  frontendCache(env)?.set(key, { value, expiresAt: Date.now() + frontendCacheTtl(key) });
+  await cacheFrontendShared(env, key, value);
+}
 function frontendCache(env) {
   if (!env.K) return null;
   let cache = frontendKVCache.get(env.K);
@@ -143,7 +186,7 @@ function frontendCache(env) {
   return cache;
 }
 function frontendCacheTtl(key) {
-  return key === "admin" || key.startsWith("quota_usage:") ? 60000 : 300000;
+  return key === "admin" ? 60000 : key.startsWith("quota_usage:") ? 900000 : 300000;
 }
 async function readFrontendValue(env, key) {
   if (!env.K || typeof env.K.get !== "function") return null;
@@ -157,7 +200,13 @@ async function readFrontendValue(env, key) {
   if (cache.size >= 64 && !cache.has(key)) cache.delete(cache.keys().next().value);
   const entry = {};
   cache.set(key, entry);
-  entry.pending = Promise.resolve().then(() => env.K.get(key)).then(
+  entry.pending = Promise.resolve().then(async () => {
+    const shared = await readFrontendShared(env, key);
+    if (shared.hit) return shared.value;
+    const value = await env.K.get(key);
+    if (cache.get(key) === entry) await cacheFrontendShared(env, key, value);
+    return value;
+  }).then(
     (value) => {
       if (cache.get(key) === entry)
         cache.set(key, { value, expiresAt: Date.now() + frontendCacheTtl(key) });
@@ -178,7 +227,10 @@ async function writeFrontendValue(env, key, value, options) {
       Date.now() < previous.expiresAt && previous.value === value) return;
   const entry = {};
   cache.set(key, entry);
-  entry.pending = Promise.resolve().then(() => env.K.put(key, value, options)).then(
+  entry.pending = Promise.resolve().then(async () => {
+    await env.K.put(key, value, options);
+    await cacheFrontendShared(env, key, value);
+  }).then(
     () => {
       if (cache.get(key) === entry)
         cache.set(key, { value, expiresAt: Date.now() + frontendCacheTtl(key) });
@@ -195,7 +247,10 @@ async function deleteFrontendValue(env, key) {
   const cache = frontendCache(env);
   const entry = {};
   cache.set(key, entry);
-  entry.pending = Promise.resolve().then(() => env.K.delete(key)).then(
+  entry.pending = Promise.resolve().then(async () => {
+    await env.K.delete(key);
+    await cacheFrontendShared(env, key, null);
+  }).then(
     () => {
       if (cache.get(key) === entry)
         cache.set(key, { value: null, expiresAt: Date.now() + frontendCacheTtl(key) });
@@ -3474,10 +3529,11 @@ async function quotaSnapshot(env, account) {
   const cached = quotaCache.get(account.id);
   const sameAccount = cached && cached.store === env.K && cached.token === account.token;
   if (sameAccount && Date.now() - cached.loadedAt < 60000) return cached;
-  // 写入失败或边缘副本尚未更新时，不让空值/旧快照覆盖刚查到的用量。
+  // 额度来自 Cloudflare；监控结果只缓存，不再读写 KV 快照。
   let data = sameAccount ? cached.data : null;
   try {
-    const raw = await readFrontendValue(env, "quota_usage:" + account.id);
+    const shared = await readFrontendShared(env, "quota_usage:" + account.id);
+    const raw = shared.hit ? shared.value : null;
     if (raw) {
       const stored = JSON.parse(raw);
       if (stored && (!data || Number(stored.checkedAt || 0) > Number(data.checkedAt || 0))) data = stored;
@@ -3575,13 +3631,7 @@ async function queryQuotaAccount(env, account, force = false) {
       data: result,
       loadedAt: now,
     });
-    try {
-      if (env.K) await writeFrontendValue(env, "quota_usage:" + account.id, JSON.stringify(result), {
-        expirationTtl: 172800,
-      });
-    } catch (_) {
-      result.persistenceWarning = "本次结果保存失败，暂存于当前服务实例；切换网络后可能暂时看不到此结果。";
-    }
+    await cacheFrontendOnly(env, "quota_usage:" + account.id, JSON.stringify(result));
     return result;
   })();
   quotaPending.set(account.id, task);
