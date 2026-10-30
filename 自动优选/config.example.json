@@ -1,0 +1,18 @@
+{
+  "panel": "https://YOUR-PANEL.pages.dev",
+  "entry": "/admin",
+  "carrier": "telecom",
+  "time": "04:10",
+  "expected_asns": [134762, 4134, 4809],
+  "source_address": "",
+  "network_probe": "curl",
+  "mihomo": "/volume1/docker/cfnext-optimizer/mihomo",
+  "password_file": "/volume1/docker/cfnext-optimizer/panel.secret",
+  "storage_file": "/volume1/docker/cfnext-optimizer/storage.secret",
+  "state_file": "/volume1/docker/cfnext-optimizer/state.json",
+  "ports": [443, 2053, 2083, 2087, 2096, 8443],
+  "screen_ips": 32,
+  "candidates_per_backend": 6,
+  "unified_delay": true,
+  "download_timeout": 45
+}
