@@ -575,6 +575,122 @@ function yamlName(value) {
   return value;
 }
 
+function carrierNodeName(name) {
+  const parts = String(name).split("·");
+  for (let i = 0; i < parts.length; i++) {
+    const match = /^(联通|电信)(?=优选|备用|$)/.exec(parts[i]);
+    if (!match) continue;
+    const carrier = match[1];
+    if (i === 0 && parts[i] === carrier) return name;
+    parts[i] = parts[i].slice(carrier.length);
+    return carrier + "·" + parts.filter(Boolean).join("·");
+  }
+  return name;
+}
+function carrierNodeOrder(names, reserved = []) {
+  const used = new Set([...names, ...reserved]);
+  const renamed = new Map();
+  for (const name of names) {
+    const base = carrierNodeName(name);
+    if (base === name) continue;
+    let next = base, suffix = 2;
+    while (used.has(next)) next = base + "·" + suffix++;
+    used.add(next);
+    renamed.set(name, next);
+  }
+  const rows = names.map((name, index) => {
+    const label = renamed.get(name) || name;
+    const carrier = label.startsWith("联通·") ? 0 : label.startsWith("电信·") ? 1 : 2;
+    const backend = /(?:^|·)后端(\d+)(?:·|$)/.exec(label);
+    const number = /(?:优选|备用)-(\d+)/.exec(label);
+    return { name, label, carrier, backend: backend ? Number(backend[1]) : Number.MAX_SAFE_INTEGER,
+      number: number ? Number(number[1]) : Number.MAX_SAFE_INTEGER, index };
+  });
+  rows.sort((a, b) => a.carrier - b.carrier ||
+    (a.carrier < 2 ? a.backend - b.backend || a.number - b.number : 0) || a.index - b.index);
+  const order = new Map(rows.map((row, index) => [row.label, index]));
+  return { renamed, rows, order };
+}
+// Keep selectors and nested-group references in their existing slots; only node
+// slots are reordered. This changes presentation without changing group membership.
+function carrierGroupMembers(members, presentation) {
+  const mapped = members.map((name) => presentation.renamed.get(name) || name);
+  const nodes = mapped.filter((name) => presentation.order.has(name))
+    .sort((a, b) => presentation.order.get(a) - presentation.order.get(b));
+  let index = 0;
+  return mapped.map((name) => presentation.order.has(name) ? nodes[index++] : name);
+}
+function splitYamlMembers(text) {
+  const parts = [];
+  let start = 0, quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (quote === '"' && char === "\\") { i++; continue; }
+    if (quote === "'" && char === "'" && text[i + 1] === "'") { i++; continue; }
+    if (quote) { if (char === quote) quote = ""; }
+    else if (char === '"' || char === "'") quote = char;
+    else if (char === ",") { parts.push(text.slice(start, i)); start = i + 1; }
+  }
+  parts.push(text.slice(start));
+  return parts.filter((part) => part.trim()).map(yamlName);
+}
+function clashSection(text, key) {
+  const match = new RegExp("(^|\\n)" + key + ":[ \\t]*(?:\\r?\\n|$)").exec(text);
+  if (!match) return null;
+  const start = match.index + match[0].length;
+  const rest = text.slice(start);
+  const next = /\n[A-Za-z][\w-]*:/.exec(rest);
+  return { start, end: next ? start + next.index : text.length };
+}
+function organizeClashCarriers(text) {
+  const section = clashSection(text, "proxies");
+  if (!section) return text;
+  const body = text.slice(section.start, section.end);
+  const starts = [...body.matchAll(/^  - name:[ \t]*(.+)\r?$/gm)];
+  if (!starts.length) return text;
+  const groups = clashSection(text, "proxy-groups");
+  const groupBody = groups ? text.slice(groups.start, groups.end) : "";
+  const reserved = [...groupBody.matchAll(/^  - (?:\{)?name:[ \t]*("(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[^,\r\n}]+)/gm)]
+    .map((match) => yamlName(match[1]));
+  const presentation = carrierNodeOrder(starts.map((match) => yamlName(match[1])), reserved);
+  const blocks = starts.map((match, index) => body.slice(match.index, starts[index + 1]?.index ?? body.length));
+  const sorted = presentation.rows.map((row) => {
+    let block = blocks[row.index].replace(/^  - name:[^\r\n]*/, "  - name: " + JSON.stringify(row.label));
+    block = block.replace(/^(    dialer-proxy:[ \t]*)(.+)\r?$/gm, (line, prefix, value) => {
+      const name = yamlName(value);
+      return presentation.renamed.has(name) ? prefix + JSON.stringify(presentation.renamed.get(name)) : line;
+    });
+    return block.endsWith("\n") ? block : block + "\n";
+  }).join("");
+  text = text.slice(0, section.start) + body.slice(0, starts[0].index) + sorted + text.slice(section.end);
+  const updatedGroups = clashSection(text, "proxy-groups");
+  if (updatedGroups) {
+    let content = text.slice(updatedGroups.start, updatedGroups.end);
+    content = content.replace(/(\bproxies:[ \t]*\[)((?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[^\]"'])*)\]/g,
+      (_, prefix, members) => prefix + carrierGroupMembers(splitYamlMembers(members), presentation).map(JSON.stringify).join(", ") + "]");
+    content = content.replace(/(^    proxies:[ \t]*\r?\n)((?:^      - .*(?:\r?\n|$))*)/gm,
+      (_, prefix, members) => prefix + carrierGroupMembers([...members.matchAll(/^      - (.+)\r?$/gm)].map((m) => yamlName(m[1])), presentation)
+        .map((name) => "      - " + JSON.stringify(name) + "\n").join(""));
+    text = text.slice(0, updatedGroups.start) + content + text.slice(updatedGroups.end);
+  }
+  const rules = clashSection(text, "rules");
+  if (rules) {
+    const content = text.slice(rules.start, rules.end).replace(/^(\s*-\s*)(.+)$/gm, (line, prefix, value) => {
+      const rule = yamlName(value);
+      const option = /,\s*no-resolve\s*$/.exec(rule);
+      const policy = option ? rule.slice(0, option.index) : rule;
+      for (const [name, label] of presentation.renamed) {
+        if (policy.endsWith("," + name)) {
+          return prefix + JSON.stringify(policy.slice(0, -name.length) + label + (option ? option[0] : ""));
+        }
+      }
+      return line;
+    });
+    text = text.slice(0, rules.start) + content + text.slice(rules.end);
+  }
+  return text;
+}
+
 // Add every backend's nodes to the primary node-selection groups as well as proxies.
 function mergeClash(ok) {
   let merged = ok[0].text;
@@ -631,7 +747,7 @@ function mergeClash(ok) {
   }
   const first = merged.split("\n")[0];
   if (first.startsWith("#")) merged = merged.replace(first, first + " · 聚合 " + ok.length + " 后端");
-  return merged;
+  return organizeClashCarriers(merged);
 }
 function mergeSingbox(ok) {
   let base;
@@ -674,6 +790,32 @@ function mergeSingbox(ok) {
     if (["selector", "urltest"].includes(group.type) && group.outbounds?.some((tag) => firstNames.has(tag))) {
       group.outbounds = [...new Set([...group.outbounds, ...additions])];
     }
+  }
+  const nodes = base.outbounds.filter(isNode);
+  const presentation = carrierNodeOrder(nodes.map((node) => node.tag), base.outbounds.filter((node) => !isNode(node)).map((node) => node.tag));
+  const ordered = presentation.rows.map((row) => {
+    const node = nodes[row.index];
+    node.tag = row.label;
+    if (presentation.renamed.has(node.detour)) node.detour = presentation.renamed.get(node.detour);
+    return node;
+  });
+  let index = 0;
+  base.outbounds = base.outbounds.map((outbound) => {
+    if (isNode(outbound)) return ordered[index++];
+    if (Array.isArray(outbound.outbounds)) outbound.outbounds = carrierGroupMembers(outbound.outbounds, presentation);
+    if (presentation.renamed.has(outbound.default)) outbound.default = presentation.renamed.get(outbound.default);
+    return outbound;
+  });
+  const remapRoute = (value) => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if ((key === "outbound" || key === "final") && presentation.renamed.has(child)) value[key] = presentation.renamed.get(child);
+      else if (child && typeof child === "object") remapRoute(child);
+    }
+  };
+  remapRoute(base.route);
+  for (const server of base.dns?.servers || []) {
+    if (presentation.renamed.has(server.detour)) server.detour = presentation.renamed.get(server.detour);
   }
   return JSON.stringify(base);
 }
