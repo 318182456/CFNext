@@ -6,6 +6,7 @@
   "expected_asns": [134762, 4134, 4809],
   "source_address": "",
   "network_probe": "curl",
+  "management_transport": "curl",
   "mihomo": "/volume1/docker/cfnext-optimizer/mihomo",
   "password_file": "/volume1/docker/cfnext-optimizer/panel.secret",
   "storage_file": "/volume1/docker/cfnext-optimizer/storage.secret",

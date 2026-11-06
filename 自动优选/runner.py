@@ -6,6 +6,7 @@ import ctypes
 import datetime as dt
 import http.cookiejar
 import http.client
+import io
 import ipaddress
 import json
 import logging
@@ -22,7 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from history import TIMEZONE, rank_history, select_preferred, update_history
+from history import TIMEZONE, performance_score, rank_history, select_preferred, update_history
 
 LOG = logging.getLogger("cfnext-optimizer")
 PORTS = [443, 2053, 2083, 2087, 2096, 8443]
@@ -32,15 +33,56 @@ class SourceUnavailable(Exception):
     pass
 
 
-def direct_opener(config, *handlers):
+def native_management_request(request, config, cookie_file=None, timeout=30):
+    """Native HTTPS for NAS management traffic; credentials travel in stdin, never argv/logs."""
+    if urllib.parse.urlsplit(request.full_url).scheme != "https":
+        raise ValueError("Management transport requires HTTPS")
+    # ASVS 1.2.5/2.2.1: parameterized invocation, escaped curl config, bounded payload and deadlines.
+    options = ["url = " + json.dumps(request.full_url), "request = " + json.dumps(request.get_method()),
+               "silent", "show-error", "connect-timeout = " + str(min(timeout, 10)), "max-time = " + str(timeout), 'user-agent = "Mozilla/5.0"']
+    if config.get("source_address"):
+        options.append("interface = " + json.dumps(config["source_address"]))
+    for key, value in request.header_items():
+        options.append("header = " + json.dumps(key + ": " + value))
+    if request.data is not None:
+        if len(request.data) > 2 * 1048576:
+            raise ValueError("Management payload too large")
+        options.append("data-binary = " + json.dumps(request.data.decode("utf-8"), ensure_ascii=False))
+    default_curl = str(pathlib.Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/curl.exe") if os.name == "nt" else "/usr/bin/curl"
+    command = [config.get("curl", default_curl), "-q", "--ipv4", "--noproxy", "*", "--config", "-", "--write-out", "\n%{http_code}"]
+    if cookie_file:
+        command.extend(["--cookie", str(cookie_file), "--cookie-jar", str(cookie_file)])
+    process = subprocess.run(command,
+                             input=("\n".join(options) + "\n").encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout + 5)
+    if cookie_file and pathlib.Path(cookie_file).exists():
+        os.chmod(cookie_file, 0o600)
+    if process.returncode:
+        raise urllib.error.URLError("Native management transport unavailable")
+    content, status = process.stdout.rsplit(b"\n", 1)
+    if not 200 <= int(status) < 300:
+        raise urllib.error.HTTPError(request.full_url, int(status), "Management request rejected", {}, io.BytesIO(content))
+    return content
+
+
+def direct_opener(config, *handlers, panel_entries=None):
     source = config.get("source_address")
-    if not source:
+    if not source and not panel_entries:
         return urllib.request.build_opener(urllib.request.ProxyHandler({}), *handlers)
+    entries = iter(())
+    if panel_entries:
+        import itertools
+        entries = itertools.cycle(panel_entries)
 
     class BoundHTTPSHandler(urllib.request.HTTPSHandler):
         def https_open(self, request):
             def connection(host, **kwargs):
-                return http.client.HTTPSConnection(host, source_address=(source, 0), **kwargs)
+                conn = http.client.HTTPSConnection(host, source_address=(source, 0) if source else None, **kwargs)
+                if panel_entries:
+                    entry = next(entries)
+                    # ASVS 1.2.2: only the socket destination changes; TLS still verifies the panel hostname.
+                    conn._create_connection = lambda address, timeout=None, source_address=None: socket.create_connection(
+                        entry, timeout=min(timeout or 15, 15), source_address=source_address)
+                return conn
             return self.do_open(connection, request, context=self._context, check_hostname=self._check_hostname)
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), BoundHTTPSHandler(), *handlers)
 
@@ -90,11 +132,25 @@ class Panel:
         if urllib.parse.urlsplit(self.origin).scheme != "https":
             raise ValueError("Panel must use HTTPS")
         jar = http.cookiejar.CookieJar()
-        self.opener = direct_opener(config, urllib.request.HTTPCookieProcessor(jar))
+        entries = []
+        native = config.get("management_transport") == "curl"
+        self.cookie_directory = tempfile.TemporaryDirectory(prefix="cfnext-control-") if native else None
+        self.cookie_file = pathlib.Path(self.cookie_directory.name) / "cookies.txt" if native else None
+        if not native and config.get("storage_file") and config.get("carrier"):
+            storage = json.loads(protect_secret(pathlib.Path(config["storage_file"]).read_bytes(), decrypt=True))
+            label = {"unicom": "联通", "telecom": "电信"}[config["carrier"]]
+            for credentials in list(storage.values())[:2]:
+                raw = HistoryStore(credentials, config).value("config") or {}
+                for node in raw.get("preferredIPs", []):
+                    if label in node.get("name", ""):
+                        ip, port = str(ipaddress.IPv4Address(node["ip"])), int(node.get("port", 443))
+                        if ipaddress.ip_address(ip).is_global and 1 <= port <= 65535 and (ip, port) not in entries:
+                            entries.append((ip, port))
+        self.opener = direct_opener(config, urllib.request.HTTPCookieProcessor(jar), panel_entries=entries)
         password = protect_secret(pathlib.Path(config["password_file"]).read_bytes(), decrypt=True).decode()
         self.call(config.get("entry", "/admin"), {"password": password})
 
-    def call(self, path, body=None, backend=None):
+    def call(self, path, body=None, backend=None, timeout=30, max_attempts=None):
         headers = {"User-Agent": "CFNext-Daily-Optimizer", "Accept": "application/json"}
         if backend:
             headers["x-cfnext-config-backend"] = backend
@@ -102,11 +158,20 @@ class Panel:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(self.origin + path, data=None if body is None else json.dumps(body).encode(), headers=headers)
         attempts = 3 if body is None or path == self.config.get("entry", "/admin") or path.endswith("/candidates") else 1
+        if max_attempts is not None:
+            attempts = max_attempts
         for attempt in range(attempts):
             try:
-                with self.opener.open(req, timeout=30) as response:
-                    data = json.load(response)
+                if self.cookie_file:
+                    data = json.loads(native_management_request(req, self.config, self.cookie_file, timeout))
+                else:
+                    with self.opener.open(req, timeout=timeout) as response:
+                        data = json.load(response)
                 break
+            except urllib.error.HTTPError as error:
+                if 400 <= error.code < 500 or attempt == attempts - 1:
+                    raise
+                time.sleep(1)
             except (TimeoutError, urllib.error.URLError):
                 if attempt == attempts - 1:
                     raise
@@ -116,14 +181,16 @@ class Panel:
         return data
 
     def api(self, backend, action, body=None):
-        return self.call(self.config.get("entry", "/admin") + "/api/" + action, body, backend)
+        options = {"timeout": 12, "max_attempts": 1} if action == "candidates" else {}
+        return self.call(self.config.get("entry", "/admin") + "/api/" + action, body, backend, **options)
 
 
 class HistoryStore:
     """Official Cloudflare KV management API; no history access on proxy request paths."""
     def __init__(self, credentials, config=None):
         self.credentials = credentials
-        self.opener = direct_opener(config or {})
+        self.settings = config or {}
+        self.opener = direct_opener(self.settings)
 
     def value(self, key, body=None):
         c = self.credentials
@@ -133,12 +200,25 @@ class HistoryStore:
                                      data=None if body is None else json.dumps(body, ensure_ascii=False).encode(),
                                      method="GET" if body is None else "PUT")
         try:
-            with self.opener.open(req, timeout=30) as response:
-                result = json.load(response)
+            if self.settings.get("management_transport") == "curl":
+                result = json.loads(native_management_request(req, self.settings))
+            else:
+                with self.opener.open(req, timeout=30) as response:
+                    result = json.load(response)
         except urllib.error.HTTPError as error:
             if error.code == 404 and body is None:
                 return None
             raise
+        except (OSError, urllib.error.URLError):
+            if self.settings.get("management_transport") == "curl":
+                raise
+            LOG.warning("KV Python HTTPS unavailable; retrying the same request with native HTTPS")
+            try:
+                result = json.loads(native_management_request(req, self.settings))
+            except urllib.error.HTTPError as fallback_error:
+                if fallback_error.code == 404 and body is None:
+                    return None
+                raise
         if body is not None and not result.get("success"):
             raise RuntimeError("KV write rejected")
         return result
@@ -150,13 +230,13 @@ class HistoryStore:
         history["days"] = [d for d in history["days"] if d["day"] >= cutoff]
         return history
 
-    def submit(self, carrier, results, backend_number, expected_uuid):
-        history, duplicate = update_history(self.read(carrier), results)
-        if not duplicate:
+    def submit(self, carrier, results, backend_number, expected_uuid, refresh=False, apply=True):
+        history, duplicate = update_history(self.read(carrier), results, refresh=refresh)
+        if not duplicate or refresh:
             self.value("optimizer-history:" + carrier, history)
         ranking = rank_history(history)
         changed = False
-        if any(r["eligible"] for r in ranking):
+        if apply and any(r["eligible"] for r in ranking):
             # Read the latest persisted config before a partial edit, preserving the other carrier.
             config = self.value("config")
             if not isinstance(config, dict) or config.get("uuid", expected_uuid) != expected_uuid:
@@ -166,7 +246,8 @@ class HistoryStore:
                 config["preferredIPs"] = preferred
                 self.value("config", config)
                 changed = True
-        return {"days": len(history["days"]), "changed": changed, "duplicate": duplicate}
+        return {"days": len(history["days"]), "changed": changed, "duplicate": duplicate,
+                "eligible": sum(r["eligible"] for r in ranking)}
 
 
 def free_port():
@@ -343,32 +424,43 @@ def shortlist(candidates, ranking, current, config):
         buckets = [bucket for bucket in buckets if bucket]
     random.shuffle(fresh)
     champions = []
-    for row in list(current) + ranking:
+    for row in current:
         pair = (row["ip"], row.get("port", 443))
         if pair[0] not in [p[0] for p in champions]:
             champions.append(pair)
-        if len(champions) >= 3:
+    pending = [r for r in ranking if r["ip"] not in [p[0] for p in champions]
+               and r["successRate"] >= .8 and r.get("speedP25")]
+    # Finish promising candidates' multi-day trials before rotating to another random pool.
+    pending.sort(key=lambda r: (0 if r["days"] >= 2 else 1, r["score"], -r["days"]))
+    for row in pending:
+        if row["ip"] not in [p[0] for p in champions]:
+            champions.append((row["ip"], row["port"]))
+        if len(champions) >= len(current) + 2:
             break
     pairs = list(dict.fromkeys(champions + [(ip, port) for ip in fresh for port in ports]))
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         checked = list(pool.map(lambda pair: tcp_probe(pair, config.get("source_address")), pairs))
     alive = sorted([(pair, delay) for pair, delay in checked if delay is not None], key=lambda r: r[1])
     # Always recheck historical/current nodes with the real proxy, even if TCP screening failed.
-    keep = champions[:3]
+    limit = max(4, min(12, int(config.get("candidates_per_backend", 6))))
+    exploration = max(0, min(2, int(config.get("exploration_count", 2))))
+    keep = champions[:limit - exploration]
+    if len(keep) >= limit:
+        return keep
     for pair, _ in alive:
         if pair not in keep and pair[0] not in [p[0] for p in keep]:
             keep.append(pair)
-        if len(keep) >= config.get("candidates_per_backend", 6):
+        if len(keep) >= limit:
             break
     return keep
 
 
-def run(config, force=False):
+def run(config, force=False, refresh=False, collect_only=False):
     state_path = pathlib.Path(config["state_file"])
     state = json_read(state_path, {})
     now = dt.datetime.now(TIMEZONE)
     today = now.date().isoformat()
-    if state.get("completed_day") == today:
+    if not refresh and state.get("completed_day") == today:
         return
     hour, minute = map(int, config.get("time", "03:10").split(":"))
     if not force and (now.hour, now.minute) < (hour, minute):
@@ -408,7 +500,7 @@ def run(config, force=False):
     errors = 0
     for backend in backends:
         url, number = backend["url"], backend["index"] + 1
-        if state.get(url) == today:
+        if not refresh and state.get(url) == today:
             continue
         step = "config"
         try:
@@ -418,16 +510,21 @@ def run(config, force=False):
             step = "history"
             store = HistoryStore(storage[cfg["uuid"]], config)
             history = store.read(config["carrier"])
-            if any(day["day"] == today for day in history["days"]):
-                store.submit(config["carrier"], [], number, cfg["uuid"])
+            if not refresh and any(day["day"] == today for day in history["days"]):
+                store.submit(config["carrier"], [], number, cfg["uuid"], apply=not collect_only)
                 state[url] = today
                 json_write(state_path, state)
                 continue
             template = next(n for n in nodes if n.get("type") == "vless" and n.get("uuid") == cfg["uuid"] and n.get("transport", {}).get("type") == "ws")
             step = "candidates"
-            candidates = panel.api(url, "candidates", {"count": 100, "useCidr": False})["data"]
+            try:
+                candidates = rank_history(history) if refresh else panel.api(url, "candidates", {"count": 100, "useCidr": False})["data"]
+            except (OSError, ValueError, urllib.error.URLError) as error:
+                LOG.warning("backend=%d candidate source unavailable HTTP=%s; reusing saved history", number, getattr(error, "code", "network"))
+                candidates = rank_history(history)
             current = [n for n in cfg.get("preferredIPs", []) if label in n.get("name", "")]
-            pairs = shortlist(candidates, rank_history(history), current, config)
+            screening = {**config, "screen_ips": 0, "candidates_per_backend": max(4, min(12, len(current) + 2)), "exploration_count": 0} if refresh else config
+            pairs = shortlist(candidates, rank_history(history), current, screening)
             if not pairs:
                 raise RuntimeError("No candidates; existing nodes retained")
             LOG.info("backend=%d shortlisted=%d", number, len(pairs))
@@ -449,8 +546,10 @@ def run(config, force=False):
                     results.append({"ip": ip, "port": port, "latencies": delays, "downloads": downloads})
                     LOG.info("backend=%d carrier=%s candidate=%d/%d latency_ok=%d/3 downloads_ok=%d/2", number, config["carrier"], index + 1, len(pairs), sum(d is not None for d in delays), sum(d["ok"] for d in downloads))
                 good = [r for r in results if all(d["ok"] for d in r["downloads"]) and all(d is not None for d in r["latencies"])]
-                good.sort(key=lambda r: min(d["bytes"] / d["seconds"] for d in r["downloads"]), reverse=True)
-                for row in good[:2]:
+                old = {(r["ip"], r["port"]): r for r in rank_history(history)}
+                good.sort(key=lambda r: (0 if old.get((r["ip"], r["port"]), {}).get("days", 0) >= 2 else 1,
+                                        performance_score(max(r["latencies"]), min(d["bytes"] / d["seconds"] for d in r["downloads"]))))
+                for row in good[:3]:
                     engine.candidate(row["ip"], row["port"])
                     try:
                         row["downloads"].append(engine.download(32 * 1048576))
@@ -461,10 +560,10 @@ def run(config, force=False):
             step = "upload"
             if not results:
                 raise SourceUnavailable("No valid source measurements; existing history retained")
-            outcome = store.submit(config["carrier"], results, number, cfg["uuid"])
+            outcome = store.submit(config["carrier"], results, number, cfg["uuid"], refresh=refresh, apply=not collect_only)
             state[url] = today
             json_write(state_path, state)
-            LOG.info("backend=%d uploaded=%d history_days=%d changed=%s", number, len(results), outcome["days"], outcome["changed"])
+            LOG.info("backend=%d uploaded=%d history_days=%d eligible=%d changed=%s", number, len(results), outcome["days"], outcome["eligible"], outcome["changed"])
         except Exception as error:
             errors += 1
             # Avoid logging exception messages that could contain endpoint credentials or tokens.
@@ -473,6 +572,21 @@ def run(config, force=False):
         raise RuntimeError("Some backends failed; next scheduled wake will retry pending backends")
     state["completed_day"] = today
     json_write(state_path, state)
+
+
+def apply_saved_history(config):
+    """Apply only today's already-validated results; useful after parallel carrier collection."""
+    panel = Panel(config)
+    storage = json.loads(protect_secret(pathlib.Path(config["storage_file"]).read_bytes(), decrypt=True))
+    today = dt.datetime.now(TIMEZONE).date().isoformat()
+    for row in panel.call("/preferred-backends")["backends"]:
+        cfg = panel.api(row["url"], "config")["data"]
+        store = HistoryStore(storage[cfg["uuid"]], config)
+        if not any(d["day"] == today for d in store.read(config["carrier"])["days"]):
+            LOG.info("backend=%d no fresh history; skipped", row["index"] + 1)
+            continue
+        outcome = store.submit(config["carrier"], [], row["index"] + 1, cfg["uuid"])
+        LOG.info("backend=%d apply-history eligible=%d changed=%s", row["index"] + 1, outcome["eligible"], outcome["changed"])
 
 
 @contextlib.contextmanager
@@ -502,7 +616,10 @@ def process_lock(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--run-now", action="store_true", help="Ignore time-of-day; still only uploads once per UTC day")
+    parser.add_argument("--run-now", action="store_true", help="Ignore time-of-day; still only uploads once per Beijing-time day")
+    parser.add_argument("--refresh-today", action="store_true", help="Explicit supplementary recheck; merge samples without counting the date twice")
+    parser.add_argument("--collect-only", action="store_true", help="Upload measurements without editing preferred nodes")
+    parser.add_argument("--apply-history", action="store_true", help="Apply today's saved eligible measurements without benchmarking again")
     parser.add_argument("--set-password", action="store_true", help="Read panel password from stdin; encrypt with Windows DPAPI or store mode 0600 on Linux")
     parser.add_argument("--set-storage", action="store_true", help="Read UUID-to-account/namespace/token mapping JSON from stdin; protect it like the panel password")
     parser.add_argument("--check", action="store_true", help="Read-only login, backend and optimizer endpoint checks")
@@ -532,6 +649,9 @@ def main():
     with process_lock(str(config["state_file"]) + ".lock") as acquired:
         if not acquired:
             return
+        if args.apply_history:
+            apply_saved_history(config)
+            return
         if args.check:
             panel = Panel(config)
             rows = panel.call("/preferred-backends")["backends"]
@@ -541,12 +661,12 @@ def main():
                 HistoryStore(storage[cfg["uuid"]], config).read(config["carrier"])
             LOG.info("Read-only check passed: %d backends", len(rows))
             return
-        run(config, args.run_now)
+        run(config, args.run_now or args.refresh_today, args.refresh_today, args.collect_only)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        LOG.error("Optimizer stopped (%s)", type(error).__name__)
+        LOG.error("Optimizer stopped (%s) file=%s", type(error).__name__, pathlib.Path(error.filename).name if isinstance(error, OSError) and error.filename else "n/a")
         sys.exit(1)

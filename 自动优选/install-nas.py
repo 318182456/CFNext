@@ -48,6 +48,11 @@ def main():
     for name in ["runner.py", "history.py", "config.json", "panel.secret", "storage.secret", "mihomo"]:
         os.chown(str(root / name), account.pw_uid, account.pw_gid)
         os.chmod(str(root / name), 0o700 if name == "mihomo" else 0o600)
+    # Reinstalling under an ordinary account must also migrate existing root-written runtime files.
+    for name in ["state.json", "state.json.lock", "optimizer.log"]:
+        if (root / name).exists():
+            os.chown(str(root / name), account.pw_uid, account.pw_gid)
+            os.chmod(str(root / name), 0o600)
     # Only the dedicated script is registered; existing tasks and running Mihomo instances are untouched.
     existing = webapi("list", version=3).get("tasks", [])
     task = next((t for t in existing if t["name"] == "CFNext-Telecom-Daily"), None)
